@@ -1,31 +1,80 @@
 const std = @import("std");
 const build_options = @import("build_options");
+const opt = @import("opt");
+
+const CompressMode = enum { auto, on, off };
+
+const Options = struct {
+    jobs: u32 = 8,
+    ssh: []const u8 = "ssh",
+    ssh_opts: []const u8 = "-oBatchMode=yes -oConnectTimeout=5",
+    port: ?u16 = null,
+    user: ?[]const u8 = null,
+    skip_md5: bool = false,
+    compress: CompressMode = .auto,
+    compress_level: u4 = 1,
+    chmod: ?u16 = 0o755,
+    tmp: ?[]const u8 = null,
+    sudo: bool = false,
+    sudo_cmd: []const u8 = "sudo -n",
+    install_owner: ?[]const u8 = null,
+    timeout: ?u32 = null,
+    stall_timeout: u32 = 10,
+    quiet: bool = false,
+    keep_tmp_on_fail: bool = false,
+    restart: ?[]const u8 = null,
+    version: bool = false,
+
+    pub const meta = .{
+        .jobs = .{ .short = 'j', .help = "Max parallel hosts" },
+        .ssh = .{ .help = "SSH binary" },
+        .ssh_opts = .{ .help = "SSH options" },
+        .port = .{ .help = "Default SSH port" },
+        .user = .{ .help = "Default SSH user" },
+        .skip_md5 = .{ .help = "Skip remote MD5 check" },
+        .compress = .{ .flag_value = .on, .no_value = .off, .help = "Compression mode" },
+        .compress_level = .{ .help = "Gzip level 1-9" },
+        .chmod = .{
+            .help = "File mode in octal (default: 755, --no-chmod to skip)",
+            .parse = struct {
+                fn p(val: []const u8) ?u16 {
+                    return std.fmt.parseInt(u16, val, 8) catch null;
+                }
+            }.p,
+        },
+        .tmp = .{ .help = "Exact temp path (skip auto-detection)" },
+        .sudo = .{ .help = "Use sudo for install" },
+        .sudo_cmd = .{ .help = "Sudo command" },
+        .install_owner = .{ .help = "Set owner:group via sudo" },
+        .timeout = .{ .help = "SSH timeout in seconds" },
+        .stall_timeout = .{ .help = "Stall timeout in seconds" },
+        .quiet = .{ .short = 'q', .help = "No progress output" },
+        .keep_tmp_on_fail = .{ .help = "Keep temp file on failure" },
+        .restart = .{ .help = "Command to run after install" },
+        .version = .{ .short = 'V', .help = "Show version" },
+    };
+
+    pub const about = .{
+        .name = "ship",
+        .desc = "Upload a file to multiple hosts in parallel",
+        .usage =
+        \\Usage: ship [options] <local_path:remote_dest> <host...>
+        \\
+        \\Host formats:
+        \\  host              use default user and dest
+        \\  user@host         specify user
+        \\  host:dest         override dest for this host
+        \\  user@host:dest    override both
+        ,
+    };
+};
 
 const Config = struct {
     local_path: []const u8,
     default_dest: []const u8,
     hosts: []HostSpec,
-    jobs: u32,
-    ssh_path: []const u8,
-    ssh_opts: []const u8,
-    default_port: ?u16,
-    default_user: ?[]const u8,
-    skip_md5: bool,
-    compress: CompressMode,
-    compress_level: u4,
-    chmod: ?u16,
-    tmp_path: ?[]const u8,
-    sudo: bool,
-    sudo_cmd: []const u8,
-    install_owner: ?[]const u8,
-    timeout: ?u32,
-    stall_timeout: u32,
-    quiet: bool,
-    keep_tmp_on_fail: bool,
-    restart_cmd: ?[]const u8,
+    opts: Options,
 };
-
-const CompressMode = enum { auto, on, off };
 
 const HostSpec = struct {
     host: []const u8,
@@ -81,181 +130,64 @@ fn parseHostSpec(spec: []const u8) HostSpec {
     return .{ .host = host, .user = user, .dest = dest };
 }
 
+fn printUsage() void {
+    var buf: [4096]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    opt.printUsage(Options, &stdout.interface);
+    stdout.interface.flush() catch {};
+}
+
 fn parseArgs(allocator: std.mem.Allocator) !?Config {
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
+    // NOTE: don't free args - strings are borrowed into Config
+    const args = try std.process.argsAlloc(allocator);
 
-    _ = args.next(); // skip program name
-
-    var jobs: u32 = 8;
-    var ssh_path: []const u8 = "ssh";
-    var ssh_opts: []const u8 = "-oBatchMode=yes -oConnectTimeout=5";
-    var default_port: ?u16 = null;
-    var default_user: ?[]const u8 = null;
-    var skip_md5 = false;
-    var compress: CompressMode = .auto;
-    var compress_level: u4 = 1;
-    var chmod: ?u16 = 0o755;
-    var tmp_path: ?[]const u8 = null;
-    var sudo = false;
-    var sudo_cmd: []const u8 = "sudo -n";
-    var install_owner: ?[]const u8 = null;
-    var timeout: ?u32 = null;
-    var stall_timeout: u32 = 10;
-    var quiet = false;
-    var keep_tmp_on_fail = false;
-    var restart_cmd: ?[]const u8 = null;
-
-    var local_path: ?[]const u8 = null;
-    var default_dest: ?[]const u8 = null;
-    var hosts: std.ArrayList(HostSpec) = .{};
-    defer hosts.deinit(allocator);
-
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+    var opts = Options{};
+    const positionals = opt.parse(Options, &opts, args[1..]) catch |e| {
+        if (e == error.Help) {
             printUsage();
             return null;
-        } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
-            std.debug.print("ship {s}\n", .{build_options.version});
-            return null;
-        } else if (std.mem.eql(u8, arg, "-j") or std.mem.eql(u8, arg, "--jobs")) {
-            const val = args.next() orelse return error.MissingValue;
-            jobs = try std.fmt.parseInt(u32, val, 10);
-        } else if (std.mem.eql(u8, arg, "--ssh")) {
-            ssh_path = args.next() orelse return error.MissingValue;
-        } else if (std.mem.eql(u8, arg, "--ssh-opts")) {
-            ssh_opts = args.next() orelse return error.MissingValue;
-        } else if (std.mem.eql(u8, arg, "--port")) {
-            const val = args.next() orelse return error.MissingValue;
-            default_port = try std.fmt.parseInt(u16, val, 10);
-        } else if (std.mem.eql(u8, arg, "--user")) {
-            default_user = args.next() orelse return error.MissingValue;
-        } else if (std.mem.eql(u8, arg, "--skip-md5")) {
-            skip_md5 = true;
-        } else if (std.mem.eql(u8, arg, "--compress")) {
-            compress = .on;
-        } else if (std.mem.eql(u8, arg, "--no-compress")) {
-            compress = .off;
-        } else if (std.mem.eql(u8, arg, "--compress=auto")) {
-            compress = .auto;
-        } else if (std.mem.eql(u8, arg, "--compress-level")) {
-            const val = args.next() orelse return error.MissingValue;
-            compress_level = try std.fmt.parseInt(u4, val, 10);
-        } else if (std.mem.eql(u8, arg, "--chmod")) {
-            const val = args.next() orelse return error.MissingValue;
-            chmod = try std.fmt.parseInt(u16, val, 8);
-        } else if (std.mem.eql(u8, arg, "--no-chmod")) {
-            chmod = null;
-        } else if (std.mem.eql(u8, arg, "--tmp")) {
-            tmp_path = args.next() orelse return error.MissingValue;
-        } else if (std.mem.eql(u8, arg, "--sudo")) {
-            sudo = true;
-        } else if (std.mem.eql(u8, arg, "--sudo-cmd")) {
-            sudo_cmd = args.next() orelse return error.MissingValue;
-        } else if (std.mem.eql(u8, arg, "--install-owner")) {
-            install_owner = args.next() orelse return error.MissingValue;
-        } else if (std.mem.eql(u8, arg, "--timeout")) {
-            const val = args.next() orelse return error.MissingValue;
-            timeout = try std.fmt.parseInt(u32, val, 10);
-        } else if (std.mem.eql(u8, arg, "--stall-timeout")) {
-            const val = args.next() orelse return error.MissingValue;
-            stall_timeout = try std.fmt.parseInt(u32, val, 10);
-        } else if (std.mem.eql(u8, arg, "--quiet")) {
-            quiet = true;
-        } else if (std.mem.eql(u8, arg, "--keep-tmp-on-fail")) {
-            keep_tmp_on_fail = true;
-        } else if (std.mem.eql(u8, arg, "--restart")) {
-            restart_cmd = args.next() orelse return error.MissingValue;
-        } else if (arg[0] == '-') {
-            std.debug.print("Unknown option: {s}\n", .{arg});
-            return error.UnknownOption;
-        } else {
-            // positional arg
-            if (local_path == null) {
-                // parse local_path:default_dest
-                if (std.mem.indexOf(u8, arg, ":")) |idx| {
-                    local_path = arg[0..idx];
-                    default_dest = arg[idx + 1 ..];
-                } else {
-                    std.debug.print("First argument must be local_path:remote_dest\n", .{});
-                    return error.InvalidArgument;
-                }
-            } else {
-                try hosts.append(allocator, parseHostSpec(arg));
-            }
         }
+        std.debug.print("Error parsing arguments: {s}\n", .{@errorName(e)});
+        return error.InvalidArgument;
+    };
+
+    if (opts.version) {
+        var buf: [64]u8 = undefined;
+        var stdout = std.fs.File.stdout().writer(&buf);
+        stdout.interface.print("ship {s}\n", .{build_options.version}) catch {};
+        stdout.interface.flush() catch {};
+        return null;
     }
 
-    if (local_path == null or hosts.items.len == 0) {
+    if (positionals.len < 2) {
         printUsage();
         return null;
     }
 
-    if (jobs > hosts.items.len) jobs = @intCast(hosts.items.len);
+    // first positional: local_path:remote_dest
+    const first = positionals[0];
+    const colon_idx = std.mem.indexOf(u8, first, ":") orelse {
+        std.debug.print("First argument must be local_path:remote_dest\n", .{});
+        return error.InvalidArgument;
+    };
+    const local_path = first[0..colon_idx];
+    const default_dest = first[colon_idx + 1 ..];
+
+    // remaining positionals: hosts
+    var hosts: std.ArrayList(HostSpec) = .{};
+    errdefer hosts.deinit(allocator);
+    for (positionals[1..]) |arg| {
+        try hosts.append(allocator, parseHostSpec(arg));
+    }
+
+    if (opts.jobs > hosts.items.len) opts.jobs = @intCast(hosts.items.len);
 
     return .{
-        .local_path = local_path.?,
-        .default_dest = default_dest.?,
+        .local_path = local_path,
+        .default_dest = default_dest,
         .hosts = try hosts.toOwnedSlice(allocator),
-        .jobs = jobs,
-        .ssh_path = ssh_path,
-        .ssh_opts = ssh_opts,
-        .default_port = default_port,
-        .default_user = default_user,
-        .skip_md5 = skip_md5,
-        .compress = compress,
-        .compress_level = compress_level,
-        .chmod = chmod,
-        .tmp_path = tmp_path,
-        .sudo = sudo,
-        .sudo_cmd = sudo_cmd,
-        .install_owner = install_owner,
-        .timeout = timeout,
-        .stall_timeout = stall_timeout,
-        .quiet = quiet,
-        .keep_tmp_on_fail = keep_tmp_on_fail,
-        .restart_cmd = restart_cmd,
+        .opts = opts,
     };
-}
-
-fn printUsage() void {
-    const usage =
-        \\Usage: ship [options] <local_path:remote_dest> <host...>
-        \\
-        \\Upload a file to multiple hosts in parallel.
-        \\
-        \\Host formats:
-        \\  host              use default user and dest
-        \\  user@host         specify user
-        \\  host:dest         override dest for this host
-        \\  user@host:dest    override both
-        \\
-        \\Options:
-        \\  -h, --help              Show this help
-        \\  -v, --version           Show version
-        \\  -j, --jobs <N>          Max parallel hosts (default: min(hosts, 8))
-        \\  --ssh <path>            SSH binary (default: ssh)
-        \\  --ssh-opts <string>     SSH options (default: -oBatchMode=yes -oConnectTimeout=5)
-        \\  --port <port>           Default SSH port
-        \\  --user <user>           Default SSH user
-        \\  --skip-md5              Skip remote MD5 check
-        \\  --compress              Force gzip compression
-        \\  --no-compress           Disable compression
-        \\  --compress-level <1-9>  Gzip level (default: 1)
-        \\  --chmod <mode>          File mode in octal (default: 0755)
-        \\  --no-chmod              Skip chmod
-        \\  --tmp <path>            Exact temp path to upload to (skip auto-detection)
-        \\  --sudo                  Use sudo for install
-        \\  --sudo-cmd <cmd>        Sudo command (default: sudo -n)
-        \\  --install-owner <u:g>   Set owner:group via sudo
-        \\  --timeout <sec>         SSH timeout (default: 30)
-        \\  --stall-timeout <sec>   Fail if no progress for N sec (default: 10)
-        \\  --quiet                 No progress output
-        \\  --keep-tmp-on-fail      Keep temp file on failure
-        \\  --restart <cmd>         Command to run after successful install
-        \\
-    ;
-    std.debug.print("{s}", .{usage});
 }
 
 fn escapeShellArg(allocator: std.mem.Allocator, arg: []const u8) ![]const u8 {
@@ -350,7 +282,7 @@ const Ship = struct {
         self.local_size = stat.size;
 
         // determine compression
-        self.use_compression = switch (self.config.compress) {
+        self.use_compression = switch (self.config.opts.compress) {
             .on => true,
             .off => false,
             .auto => self.local_size >= 512 * 1024,
@@ -359,15 +291,15 @@ const Ship = struct {
         self.output_tty = std.fs.File.stdout().isTty();
 
         // spawn workers
-        var threads = try self.allocator.alloc(std.Thread, self.config.jobs);
+        var threads = try self.allocator.alloc(std.Thread, self.config.opts.jobs);
         var next_host: u32 = 0;
 
-        for (0..self.config.jobs) |i| {
+        for (0..self.config.opts.jobs) |i| {
             threads[i] = try std.Thread.spawn(.{}, workerThread, .{ self, &next_host });
         }
 
         // progress display loop
-        if (!self.config.quiet) {
+        if (!self.config.opts.quiet) {
             try self.progressLoop(threads);
         }
 
@@ -375,7 +307,7 @@ const Ship = struct {
         self.allocator.free(threads);
 
         // final status line
-        if (!self.config.quiet) {
+        if (!self.config.opts.quiet) {
             try self.printFinalStatus();
         }
 
@@ -408,7 +340,7 @@ const Ship = struct {
         const dest = spec.dest orelse self.config.default_dest;
 
         // md5 check
-        if (!self.config.skip_md5) {
+        if (!self.config.opts.skip_md5) {
             self.setStatus(idx, .checking);
             const remote_md5 = try self.getRemoteMd5(spec, dest);
             if (remote_md5) |md5| {
@@ -430,7 +362,7 @@ const Ship = struct {
         try self.installFile(idx, spec, tmp_path, dest);
 
         // restart
-        if (self.config.restart_cmd) |cmd| {
+        if (self.config.opts.restart) |cmd| {
             self.setStatus(idx, .restarting);
             try self.runRestart(spec, cmd);
         }
@@ -457,7 +389,7 @@ const Ship = struct {
     }
 
     fn logFinalLocked(self: *Ship, idx: u32, prev: HostStatus) void {
-        if (self.output_tty or self.config.quiet) return;
+        if (self.output_tty or self.config.opts.quiet) return;
         const status = self.states[idx].status;
         const was_terminal = prev == .done or prev == .skipped or prev == .failed;
         const is_terminal = status == .done or status == .skipped or status == .failed;
@@ -511,27 +443,27 @@ const Ship = struct {
         };
         errdefer result.deinit();
 
-        try result.args.append(self.allocator, self.config.ssh_path);
+        try result.args.append(self.allocator, self.config.opts.ssh);
 
         // parse and add ssh_opts
-        var it = std.mem.splitScalar(u8, self.config.ssh_opts, ' ');
-        while (it.next()) |opt| {
-            if (opt.len > 0) try result.args.append(self.allocator, opt);
+        var it = std.mem.splitScalar(u8, self.config.opts.ssh_opts, ' ');
+        while (it.next()) |o| {
+            if (o.len > 0) try result.args.append(self.allocator, o);
         }
 
         // Add timeout via SSH options (ServerAliveInterval=timeout, ServerAliveCountMax=1)
-        const timeout = self.config.timeout orelse 30; // default 30s
+        const timeout = self.config.opts.timeout orelse 30; // default 30s
         result.timeout_str = try std.fmt.allocPrint(self.allocator, "-oServerAliveInterval={d}", .{timeout});
         try result.args.append(self.allocator, result.timeout_str.?);
         try result.args.append(self.allocator, "-oServerAliveCountMax=1");
 
-        if (self.config.default_port) |port| {
+        if (self.config.opts.port) |port| {
             try result.args.append(self.allocator, "-p");
             result.port_str = try std.fmt.allocPrint(self.allocator, "{d}", .{port});
             try result.args.append(self.allocator, result.port_str.?);
         }
 
-        const user = spec.user orelse self.config.default_user;
+        const user = spec.user orelse self.config.opts.user;
         if (user) |u| {
             try result.args.append(self.allocator, "-l");
             try result.args.append(self.allocator, u);
@@ -563,11 +495,11 @@ const Ship = struct {
         }
 
         // try with sudo if enabled
-        if (self.config.sudo) {
+        if (self.config.opts.sudo) {
             const sudo_cmd = try std.fmt.allocPrint(
                 self.allocator,
                 "{s} md5sum {s} 2>/dev/null || {s} busybox md5sum {s} 2>/dev/null",
-                .{ self.config.sudo_cmd, escaped_dest, self.config.sudo_cmd, escaped_dest },
+                .{ self.config.opts.sudo_cmd, escaped_dest, self.config.opts.sudo_cmd, escaped_dest },
             );
             defer self.allocator.free(sudo_cmd);
 
@@ -598,7 +530,7 @@ const Ship = struct {
 
     fn getTmpPath(self: *Ship, spec: HostSpec, dest: []const u8) ![]const u8 {
         // if --tmp explicitly set, use it directly (exact path, no checks)
-        if (self.config.tmp_path) |p| {
+        if (self.config.opts.tmp) |p| {
             return self.allocator.dupe(u8, p);
         }
 
@@ -681,7 +613,7 @@ const Ship = struct {
 
         // check if remote has gunzip (for auto mode)
         var actually_compress = self.use_compression;
-        if (self.config.compress == .auto and self.use_compression) {
+        if (self.config.opts.compress == .auto and self.use_compression) {
             const check_cmd = "command -v gunzip >/dev/null 2>&1 || command -v busybox >/dev/null 2>&1";
             const result = try self.runSshCommand(spec, check_cmd);
             defer self.allocator.free(result.stdout);
@@ -857,8 +789,8 @@ const Ship = struct {
         var cmds: std.ArrayList(u8) = .{};
         defer cmds.deinit(self.allocator);
 
-        const sudo_prefix = if (self.config.sudo) self.config.sudo_cmd else "";
-        const space = if (self.config.sudo) " " else "";
+        const sudo_prefix = if (self.config.opts.sudo) self.config.opts.sudo_cmd else "";
+        const space = if (self.config.opts.sudo) " " else "";
 
         // mkdir -p parent
         const parent = std.fs.path.dirname(dest) orelse "/";
@@ -872,12 +804,12 @@ const Ship = struct {
         pos += (std.fmt.bufPrint(cmd_buf[pos..], "{s}{s}mkdir -p {s} && ", .{ sudo_prefix, space, escaped_parent }) catch unreachable).len;
 
         // chmod
-        if (self.config.chmod) |mode| {
+        if (self.config.opts.chmod) |mode| {
             pos += (std.fmt.bufPrint(cmd_buf[pos..], "{s}{s}chmod {o} {s} && ", .{ sudo_prefix, space, mode, escaped_tmp }) catch unreachable).len;
         }
 
         // chown
-        if (self.config.install_owner) |owner| {
+        if (self.config.opts.install_owner) |owner| {
             const escaped_owner = try escapeShellArg(self.allocator, owner);
             defer self.allocator.free(escaped_owner);
             pos += (std.fmt.bufPrint(cmd_buf[pos..], "{s}{s}chown {s} {s} && ", .{ sudo_prefix, space, escaped_owner, escaped_tmp }) catch unreachable).len;
@@ -912,7 +844,7 @@ const Ship = struct {
                 return error.SudoRequiresPassword;
             }
             // cleanup tmp on failure (unless keep_tmp_on_fail)
-            if (!self.config.keep_tmp_on_fail) {
+            if (!self.config.opts.keep_tmp_on_fail) {
                 const cleanup = try std.fmt.allocPrint(self.allocator, "rm -f {s}", .{escaped_tmp});
                 defer self.allocator.free(cleanup);
                 const cleanup_result = self.runSshCommand(spec, cleanup) catch return error.InstallFailed;
@@ -927,11 +859,11 @@ const Ship = struct {
         const escaped_cmd = try escapeShellArg(self.allocator, cmd);
         defer self.allocator.free(escaped_cmd);
 
-        const remote_cmd = if (self.config.sudo)
-            try std.fmt.allocPrint(self.allocator, "{s} sh -c {s}", .{ self.config.sudo_cmd, escaped_cmd })
+        const remote_cmd = if (self.config.opts.sudo)
+            try std.fmt.allocPrint(self.allocator, "{s} sh -c {s}", .{ self.config.opts.sudo_cmd, escaped_cmd })
         else
             cmd;
-        defer if (self.config.sudo) self.allocator.free(remote_cmd);
+        defer if (self.config.opts.sudo) self.allocator.free(remote_cmd);
 
         const result = try self.runSshCommand(spec, remote_cmd);
         defer self.allocator.free(result.stdout);
@@ -973,7 +905,7 @@ const Ship = struct {
         };
 
         const max_by_width = if (term_width > col_width) term_width / col_width else 1;
-        const max_visible = @min(self.config.jobs, max_by_width);
+        const max_visible = @min(self.config.opts.jobs, max_by_width);
         const show_summary = self.states.len > max_visible;
 
         // Print header row once
@@ -997,7 +929,7 @@ const Ship = struct {
             stdout.writeAll(print_buf[0..pos]) catch {};
         }
 
-        const stall_ns: u64 = @as(u64, self.config.stall_timeout) * 1_000_000_000;
+        const stall_ns: u64 = @as(u64, self.config.opts.stall_timeout) * 1_000_000_000;
 
         while (!all_done) {
             std.Thread.sleep(100_000_000); // 100ms

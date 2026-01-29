@@ -10,11 +10,16 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
 
+    const opt_dep = b.dependency("opt", .{});
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
+        .imports = &.{
+            .{ .name = "opt", .module = opt_dep.module("opt") },
+        },
     });
     exe_mod.addOptions("build_options", build_options);
 
@@ -43,6 +48,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "opt", .module = opt_dep.module("opt") },
+        },
     });
 
     const unit_tests = b.addTest(.{

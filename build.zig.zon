@@ -1,0 +1,12 @@
+.{
+    .name = .ship,
+    .version = "0.15.2",
+    .dependencies = .{
+        .opt = .{
+            .url = "https://github.com/piranha/opt.zig/archive/refs/heads/main.tar.gz",
+            .hash = "opt-0.1.0-mfhJVauJAADgldKWgUeioTUsTsdGRUC-D-Yo6vBAMfQo",
+        },
+    },
+    .paths = .{""},
+    .fingerprint = 0xfa30eb24d173e436,
+}
