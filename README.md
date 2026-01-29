@@ -22,10 +22,14 @@ OK         85% 24M    OK         INS
 ## Install
 
 ```bash
-# Build from source (requires Zig 0.15+)
-zig build --release=fast -Dstrip=true
-cp zig-out/bin/ship /usr/local/bin/
+curl -fsSL https://github.com/piranha/ship/releases/latest/download/ship-$(uname -s)-$(uname -m) \
+  -o ~/bin/ship && chmod +x ~/bin/ship
 ```
+
+Or grab a binary from [releases](https://github.com/piranha/ship/releases).
+
+> [!NOTE]
+> macOS users: if you get a quarantine warning, run `xattr -d com.apple.quarantine ~/bin/ship`
 
 ## Usage
 
