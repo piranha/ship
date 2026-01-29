@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 
 const Config = struct {
     local_path: []const u8,
@@ -113,6 +114,9 @@ fn parseArgs(allocator: std.mem.Allocator) !?Config {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             printUsage();
+            return null;
+        } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
+            std.debug.print("ship {s}\n", .{build_options.version});
             return null;
         } else if (std.mem.eql(u8, arg, "-j") or std.mem.eql(u8, arg, "--jobs")) {
             const val = args.next() orelse return error.MissingValue;
@@ -231,6 +235,7 @@ fn printUsage() void {
         \\
         \\Options:
         \\  -h, --help              Show this help
+        \\  -v, --version           Show version
         \\  -j, --jobs <N>          Max parallel hosts (default: min(hosts, 8))
         \\  --ssh <path>            SSH binary (default: ssh)
         \\  --ssh-opts <string>     SSH options (default: -oBatchMode=yes -oConnectTimeout=5)
@@ -802,9 +807,19 @@ const Ship = struct {
 
         // Detect terminal width, limit visible hosts
         const term_width: usize = blk: {
-            var wsz: std.posix.winsize = undefined;
-            const rc = std.posix.system.ioctl(stdout.handle, std.posix.T.IOCGWINSZ, @intFromPtr(&wsz));
-            if (rc == 0 and wsz.col > 0) break :blk wsz.col;
+            const native = @import("builtin").os.tag;
+            if (native == .windows) {
+                const kernel32 = std.os.windows.kernel32;
+                var info: std.os.windows.CONSOLE_SCREEN_BUFFER_INFO = undefined;
+                if (kernel32.GetConsoleScreenBufferInfo(stdout.handle, &info) != 0) {
+                    const w = info.srWindow.Right - info.srWindow.Left + 1;
+                    if (w > 0) break :blk @intCast(w);
+                }
+            } else {
+                var wsz: std.posix.winsize = undefined;
+                const rc = std.posix.system.ioctl(stdout.handle, std.posix.T.IOCGWINSZ, @intFromPtr(&wsz));
+                if (rc == 0 and wsz.col > 0) break :blk wsz.col;
+            }
             break :blk 80; // fallback
         };
 

@@ -1,4 +1,4 @@
-.PHONY: build release clean test run
+.PHONY: build release clean test run ciall
 
 build:
 	zig build
@@ -18,3 +18,15 @@ test:
 
 run:
 	zig build run -- $(ARGS)
+
+ifndef VERSION
+ciall:
+	$(error VERSION is not set)
+else
+ciall:
+	zig build --release=fast -Dstrip=true -Dversion=${VERSION} -Dtarget=x86_64-linux-musl  -Doutput=dist/ship-Linux-x86_64
+	zig build --release=fast -Dstrip=true -Dversion=${VERSION} -Dtarget=aarch64-linux-musl -Doutput=dist/ship-Linux-aarch64
+	zig build --release=fast -Dstrip=true -Dversion=${VERSION} -Dtarget=x86_64-macos       -Doutput=dist/ship-Darwin-x86_64
+	zig build --release=fast -Dstrip=true -Dversion=${VERSION} -Dtarget=aarch64-macos      -Doutput=dist/ship-Darwin-arm64
+	zig build --release=fast -Dstrip=true -Dversion=${VERSION} -Dtarget=x86_64-windows     -Doutput=dist/ship-Windows-x86_64.exe
+endif

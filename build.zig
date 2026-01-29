@@ -4,6 +4,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "Strip debug info from binary") orelse false;
+    const version = b.option([]const u8, "version", "Version string") orelse "dev";
+    const output = b.option([]const u8, "output", "Custom output path (e.g., dist/ship-Linux-x86_64)");
+
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -11,13 +16,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
     });
+    exe_mod.addOptions("build_options", build_options);
 
     const exe = b.addExecutable(.{
         .name = "ship",
         .root_module = exe_mod,
     });
 
-    b.installArtifact(exe);
+    if (output) |out_path| {
+        const install = b.addInstallFileWithDir(exe.getEmittedBin(), .prefix, out_path);
+        b.getInstallStep().dependOn(&install.step);
+    } else {
+        b.installArtifact(exe);
+    }
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
