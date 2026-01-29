@@ -14,8 +14,7 @@ const Config = struct {
     compress: CompressMode,
     compress_level: u4,
     chmod: ?u16,
-    tmp_dir: []const u8,
-    tmp_name: []const u8,
+    tmp_path: ?[]const u8,
     sudo: bool,
     sudo_cmd: []const u8,
     install_owner: ?[]const u8,
@@ -97,8 +96,7 @@ fn parseArgs(allocator: std.mem.Allocator) !?Config {
     var compress: CompressMode = .auto;
     var compress_level: u4 = 1;
     var chmod: ?u16 = 0o755;
-    var tmp_dir: []const u8 = "/tmp";
-    var tmp_name: []const u8 = "ship.{basename}.{pid}.new";
+    var tmp_path: ?[]const u8 = null;
     var sudo = false;
     var sudo_cmd: []const u8 = "sudo -n";
     var install_owner: ?[]const u8 = null;
@@ -148,10 +146,8 @@ fn parseArgs(allocator: std.mem.Allocator) !?Config {
             chmod = try std.fmt.parseInt(u16, val, 8);
         } else if (std.mem.eql(u8, arg, "--no-chmod")) {
             chmod = null;
-        } else if (std.mem.eql(u8, arg, "--tmp-dir")) {
-            tmp_dir = args.next() orelse return error.MissingValue;
-        } else if (std.mem.eql(u8, arg, "--tmp-name")) {
-            tmp_name = args.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--tmp")) {
+            tmp_path = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--sudo")) {
             sudo = true;
         } else if (std.mem.eql(u8, arg, "--sudo-cmd")) {
@@ -210,8 +206,7 @@ fn parseArgs(allocator: std.mem.Allocator) !?Config {
         .compress = compress,
         .compress_level = compress_level,
         .chmod = chmod,
-        .tmp_dir = tmp_dir,
-        .tmp_name = tmp_name,
+        .tmp_path = tmp_path,
         .sudo = sudo,
         .sudo_cmd = sudo_cmd,
         .install_owner = install_owner,
@@ -249,8 +244,7 @@ fn printUsage() void {
         \\  --compress-level <1-9>  Gzip level (default: 1)
         \\  --chmod <mode>          File mode in octal (default: 0755)
         \\  --no-chmod              Skip chmod
-        \\  --tmp-dir <path>        Temp directory (default: /tmp)
-        \\  --tmp-name <template>   Temp filename template
+        \\  --tmp <path>            Exact temp path to upload to (skip auto-detection)
         \\  --sudo                  Use sudo for install
         \\  --sudo-cmd <cmd>        Sudo command (default: sudo -n)
         \\  --install-owner <u:g>   Set owner:group via sudo
@@ -427,7 +421,7 @@ const Ship = struct {
 
         // upload
         self.setStatus(idx, .uploading);
-        const tmp_path = try self.getTmpPath(spec);
+        const tmp_path = try self.getTmpPath(spec, dest);
         defer self.allocator.free(tmp_path);
         try self.uploadFile(idx, spec, tmp_path);
 
@@ -602,33 +596,83 @@ const Ship = struct {
         return result;
     }
 
-    fn getTmpPath(self: *Ship, spec: HostSpec) ![]const u8 {
-        _ = spec;
+    fn getTmpPath(self: *Ship, spec: HostSpec, dest: []const u8) ![]const u8 {
+        // if --tmp explicitly set, use it directly (exact path, no checks)
+        if (self.config.tmp_path) |p| {
+            return self.allocator.dupe(u8, p);
+        }
+
         const basename = std.fs.path.basename(self.config.local_path);
         const pid = std.os.linux.getpid();
+        const dest_dir = std.fs.path.dirname(dest) orelse "/";
 
-        // simple template substitution
-        var result: std.ArrayList(u8) = .{};
-        errdefer result.deinit(self.allocator);
-        try result.appendSlice(self.allocator, self.config.tmp_dir);
-        try result.append(self.allocator, '/');
+        // build temp filename
+        var tmp_name_buf: [256]u8 = undefined;
+        const tmp_name = std.fmt.bufPrint(&tmp_name_buf, ".ship.{s}.{d}.tmp", .{ basename, pid }) catch
+            return error.TmpPathTooLong;
 
-        var i: usize = 0;
-        while (i < self.config.tmp_name.len) {
-            if (std.mem.startsWith(u8, self.config.tmp_name[i..], "{basename}")) {
-                try result.appendSlice(self.allocator, basename);
-                i += 10;
-            } else if (std.mem.startsWith(u8, self.config.tmp_name[i..], "{pid}")) {
-                var pid_buf: [16]u8 = undefined;
-                const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch unreachable;
-                try result.appendSlice(self.allocator, pid_str);
-                i += 5;
-            } else {
-                try result.append(self.allocator, self.config.tmp_name[i]);
-                i += 1;
+        // query remote for best temp location
+        const escaped_dest_dir = try escapeShellArg(self.allocator, dest_dir);
+        defer self.allocator.free(escaped_dest_dir);
+
+        // single ssh call to probe remote filesystem
+        // returns: dest_dev dest_free dest_writable home_dev home_free tmp_dev tmp_free
+        // note: busybox df doesn't support -B1, use -k and multiply
+        var probe_buf: [1024]u8 = undefined;
+        const probe_cmd = std.fmt.bufPrint(&probe_buf,
+            \\d={s}
+            \\dd=$(stat -c %d "$d" 2>/dev/null)
+            \\df=$(($(df -k "$d" 2>/dev/null | awk 'NR==2{{print $4}}')*1024))
+            \\dw=$(test -w "$d" && echo 1 || echo 0)
+            \\hd=$(stat -c %d ~ 2>/dev/null)
+            \\hf=$(($(df -k ~ 2>/dev/null | awk 'NR==2{{print $4}}')*1024))
+            \\td=$(stat -c %d /tmp 2>/dev/null)
+            \\tf=$(($(df -k /tmp 2>/dev/null | awk 'NR==2{{print $4}}')*1024))
+            \\echo "$dd $df $dw $hd $hf $td $tf"
+        , .{escaped_dest_dir}) catch return error.TmpPathTooLong;
+
+        const result = try self.runSshCommand(spec, probe_cmd);
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+
+        // parse output: dest_dev dest_free dest_writable home_dev home_free tmp_dev tmp_free
+        var it = std.mem.splitScalar(u8, std.mem.trimRight(u8, result.stdout, "\n"), ' ');
+        const dest_dev = it.next() orelse "";
+        const dest_free = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0;
+        const dest_writable = std.mem.eql(u8, it.next() orelse "0", "1");
+        const home_dev = it.next() orelse "";
+        const home_free = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0;
+        const tmp_dev = it.next() orelse "";
+        const tmp_free = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0;
+
+        const size_needed = self.local_size + 1024 * 1024; // 1MB margin
+
+        // pick best location: dest dir > home > /tmp
+        const tmp_dir: []const u8 = blk: {
+            if (dest_writable and dest_free >= size_needed) {
+                break :blk dest_dir;
             }
-        }
-        return result.toOwnedSlice(self.allocator);
+            if (std.mem.eql(u8, home_dev, dest_dev) and home_free >= size_needed) {
+                break :blk "~";
+            }
+            if (std.mem.eql(u8, tmp_dev, dest_dev) and tmp_free >= size_needed) {
+                break :blk "/tmp";
+            }
+            // fallback: prefer same-fs even without dest write permission (sudo will handle)
+            if (std.mem.eql(u8, home_dev, dest_dev) and home_free >= size_needed) {
+                break :blk "~";
+            }
+            if (std.mem.eql(u8, tmp_dev, dest_dev) and tmp_free >= size_needed) {
+                break :blk "/tmp";
+            }
+            // last resort: any location with space (mv will copy across fs)
+            if (dest_writable and dest_free >= size_needed) break :blk dest_dir;
+            if (home_free >= size_needed) break :blk "~";
+            if (tmp_free >= size_needed) break :blk "/tmp";
+            return error.NoSpaceOnRemote;
+        };
+
+        return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ tmp_dir, tmp_name });
     }
 
     fn uploadFile(self: *Ship, idx: u32, spec: HostSpec, tmp_path: []const u8) !void {
