@@ -394,7 +394,8 @@ const Ship = struct {
                 self.mutex.lock();
                 defer self.mutex.unlock();
                 self.states[idx].status = .failed;
-                self.states[idx].error_msg = @errorName(err);
+                if (self.states[idx].error_msg == null)
+                    self.states[idx].error_msg = @errorName(err);
                 self.failed_count += 1;
             };
         }
@@ -425,7 +426,7 @@ const Ship = struct {
 
         // install
         self.setStatus(idx, .installing);
-        try self.installFile(spec, tmp_path, dest);
+        try self.installFile(idx, spec, tmp_path, dest);
 
         // restart
         if (self.config.restart_cmd) |cmd| {
@@ -714,7 +715,7 @@ const Ship = struct {
         _ = try gzip_child.wait();
     }
 
-    fn installFile(self: *Ship, spec: HostSpec, tmp_path: []const u8, dest: []const u8) !void {
+    fn installFile(self: *Ship, idx: u32, spec: HostSpec, tmp_path: []const u8, dest: []const u8) !void {
         const escaped_tmp = try escapeShellArg(self.allocator, tmp_path);
         defer self.allocator.free(escaped_tmp);
         const escaped_dest = try escapeShellArg(self.allocator, dest);
@@ -756,6 +757,21 @@ const Ship = struct {
         defer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);
         if (result.term.Exited != 0) {
+            // store and print error immediately
+            if (result.stderr.len > 0) {
+                const first_line = if (std.mem.indexOf(u8, result.stderr, "\n")) |nl|
+                    result.stderr[0..nl]
+                else
+                    result.stderr;
+                if (first_line.len > 0) {
+                    std.debug.print("\n{s}: {s}\n", .{ spec.host, first_line });
+                    if (self.allocator.dupe(u8, first_line)) |msg| {
+                        self.mutex.lock();
+                        self.states[idx].error_msg = msg;
+                        self.mutex.unlock();
+                    } else |_| {}
+                }
+            }
             // check for sudo password prompt hint
             if (std.mem.indexOf(u8, result.stderr, "password") != null or
                 std.mem.indexOf(u8, result.stderr, "sudo") != null)
