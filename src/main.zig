@@ -156,7 +156,6 @@ fn parseArgs(allocator: std.mem.Allocator) !?Config {
         stdout.interface.flush() catch {};
         return null;
     }
-
     if (positionals.len < 2) {
         printUsage();
         return null;
@@ -202,6 +201,16 @@ fn escapeShellArg(allocator: std.mem.Allocator, arg: []const u8) ![]const u8 {
     }
     try result.append(allocator, '\'');
     return result.toOwnedSlice(allocator);
+}
+
+fn escapeRemotePath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    if (std.mem.startsWith(u8, path, "~/")) {
+        const rest = path[2..];
+        const escaped_rest = try escapeShellArg(allocator, rest);
+        defer allocator.free(escaped_rest);
+        return std.fmt.allocPrint(allocator, "\"$HOME\"/{s}", .{escaped_rest});
+    }
+    return escapeShellArg(allocator, path);
 }
 
 fn computeLocalMd5(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
@@ -421,6 +430,21 @@ const Ship = struct {
         }
     }
 
+    fn setErrorMsg(self: *Ship, idx: u32, msg: []const u8) bool {
+        if (msg.len == 0) return false;
+        if (self.allocator.dupe(u8, msg)) |dup| {
+            self.mutex.lock();
+            if (self.states[idx].error_msg == null) {
+                self.states[idx].error_msg = dup;
+                self.mutex.unlock();
+                return true;
+            }
+            self.mutex.unlock();
+            self.allocator.free(dup);
+        } else |_| {}
+        return false;
+    }
+
     const SshArgs = struct {
         args: std.ArrayList([]const u8),
         port_str: ?[]const u8,
@@ -610,7 +634,7 @@ const Ship = struct {
     }
 
     fn uploadFile(self: *Ship, idx: u32, spec: HostSpec, tmp_path: []const u8, has_gunzip: bool) !void {
-        const escaped_tmp = try escapeShellArg(self.allocator, tmp_path);
+        const escaped_tmp = try escapeRemotePath(self.allocator, tmp_path);
         defer self.allocator.free(escaped_tmp);
 
         // determine if we should compress
@@ -663,8 +687,52 @@ const Ship = struct {
         stdin.close();
         child.stdin = null;
 
+        var stdout_list: std.ArrayList(u8) = .{};
+        defer stdout_list.deinit(self.allocator);
+        var stderr_list: std.ArrayList(u8) = .{};
+        defer stderr_list.deinit(self.allocator);
+        _ = child.collectOutput(self.allocator, &stdout_list, &stderr_list, 64 * 1024) catch {};
+
         const term = try child.wait();
-        if (term.Exited != 0) {
+        const failed = switch (term) {
+            .Exited => |code| code != 0,
+            else => true,
+        };
+        if (failed) {
+            var got_msg = false;
+            const stderr_buf = stderr_list.items;
+            if (stderr_buf.len > 0) {
+                const first_line = if (std.mem.indexOf(u8, stderr_buf, "\n")) |nl|
+                    stderr_buf[0..nl]
+                else
+                    stderr_buf;
+                if (first_line.len > 0) {
+                    got_msg = self.setErrorMsg(idx, first_line);
+                }
+            }
+            if (!got_msg) {
+                const stdout_buf = stdout_list.items;
+                if (stdout_buf.len > 0) {
+                    const first_line = if (std.mem.indexOf(u8, stdout_buf, "\n")) |nl|
+                        stdout_buf[0..nl]
+                    else
+                        stdout_buf;
+                    if (first_line.len > 0) {
+                        got_msg = self.setErrorMsg(idx, first_line);
+                    }
+                }
+            }
+            if (!got_msg) {
+                const fallback = switch (term) {
+                    .Exited => |code| std.fmt.allocPrint(self.allocator, "upload failed (exit {d})", .{code}) catch null,
+                    .Signal => |sig| std.fmt.allocPrint(self.allocator, "upload failed (signal {d})", .{sig}) catch null,
+                    else => std.fmt.allocPrint(self.allocator, "upload failed", .{}) catch null,
+                };
+                if (fallback) |msg| {
+                    _ = self.setErrorMsg(idx, msg);
+                    self.allocator.free(msg);
+                }
+            }
             return error.UploadFailed;
         }
     }
@@ -777,7 +845,7 @@ const Ship = struct {
     }
 
     fn installFile(self: *Ship, idx: u32, spec: HostSpec, tmp_path: []const u8, dest: []const u8) !void {
-        const escaped_tmp = try escapeShellArg(self.allocator, tmp_path);
+        const escaped_tmp = try escapeRemotePath(self.allocator, tmp_path);
         defer self.allocator.free(escaped_tmp);
         const escaped_dest = try escapeShellArg(self.allocator, dest);
         defer self.allocator.free(escaped_dest);
