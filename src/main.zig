@@ -60,11 +60,9 @@ const Options = struct {
         .usage =
         \\Usage: ship [options] <local_path:remote_dest> <host...>
         \\
-        \\Host formats:
-        \\  host              use default user and dest
-        \\  user@host         specify user
-        \\  host:dest         override dest for this host
-        \\  user@host:dest    override both
+        \\Host format: [user@]host[:dest]
+        \\  so you can override user and destination per-host
+        \\
         ,
     };
 };
