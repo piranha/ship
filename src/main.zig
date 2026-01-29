@@ -53,6 +53,8 @@ const HostState = struct {
     start_time: std.time.Instant, // for speed calc
     last_progress_time: std.time.Instant, // for stall detection
     error_msg: ?[]const u8,
+    child_pid: ?std.posix.pid_t, // for killing on stall
+    gzip_pid: ?std.posix.pid_t, // for killing on stall (compression)
 };
 
 fn parseHostSpec(spec: []const u8) HostSpec {
@@ -306,6 +308,7 @@ const Ship = struct {
     mutex: std.Thread.Mutex,
     failed_count: u32,
     use_compression: bool,
+    output_tty: bool,
 
     fn init(allocator: std.mem.Allocator, config: Config) !*Ship {
         const ship = try allocator.create(Ship);
@@ -318,6 +321,7 @@ const Ship = struct {
             .mutex = .{},
             .failed_count = 0,
             .use_compression = false,
+            .output_tty = false,
         };
         const now = std.time.Instant.now() catch @panic("no clock");
         for (config.hosts, 0..) |host, i| {
@@ -329,6 +333,8 @@ const Ship = struct {
                 .start_time = now,
                 .last_progress_time = now,
                 .error_msg = null,
+                .child_pid = null,
+                .gzip_pid = null,
             };
         }
         return ship;
@@ -355,6 +361,8 @@ const Ship = struct {
             .off => false,
             .auto => self.local_size >= 512 * 1024,
         };
+
+        self.output_tty = std.fs.File.stdout().isTty();
 
         // spawn workers
         var threads = try self.allocator.alloc(std.Thread, self.config.jobs);
@@ -393,10 +401,9 @@ const Ship = struct {
             self.processHost(idx) catch |err| {
                 self.mutex.lock();
                 defer self.mutex.unlock();
-                self.states[idx].status = .failed;
                 if (self.states[idx].error_msg == null)
                     self.states[idx].error_msg = @errorName(err);
-                self.failed_count += 1;
+                self.setStatusLocked(idx, .failed);
             };
         }
     }
@@ -440,13 +447,40 @@ const Ship = struct {
     fn setStatus(self: *Ship, idx: u32, status: HostStatus) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        self.setStatusLocked(idx, status);
+    }
+
+    fn setStatusLocked(self: *Ship, idx: u32, status: HostStatus) void {
+        const prev = self.states[idx].status;
         self.states[idx].status = status;
-        if (status == .failed) self.failed_count += 1;
+        if (status == .failed and prev != .failed) self.failed_count += 1;
         if (status == .uploading) {
             const now = std.time.Instant.now() catch return;
             self.states[idx].start_time = now;
             self.states[idx].last_progress_time = now;
         }
+        self.logFinalLocked(idx, prev);
+    }
+
+    fn logFinalLocked(self: *Ship, idx: u32, prev: HostStatus) void {
+        if (self.output_tty or self.config.quiet) return;
+        const status = self.states[idx].status;
+        const was_terminal = prev == .done or prev == .skipped or prev == .failed;
+        const is_terminal = status == .done or status == .skipped or status == .failed;
+        if (!is_terminal or was_terminal) return;
+        const label = self.getHostLabel(self.states[idx].spec);
+        const stdout = std.fs.File.stdout();
+        var buf: [512]u8 = undefined;
+        const line = switch (status) {
+            .done => std.fmt.bufPrint(&buf, "{s} OK\n", .{label}) catch return,
+            .skipped => std.fmt.bufPrint(&buf, "{s} SKIP\n", .{label}) catch return,
+            .failed => blk: {
+                const msg = self.states[idx].error_msg orelse "unknown";
+                break :blk std.fmt.bufPrint(&buf, "{s} ERR {s}\n", .{ label, msg }) catch return;
+            },
+            else => return,
+        };
+        stdout.writeAll(line) catch {};
     }
 
     fn setProgress(self: *Ship, idx: u32, progress: u8, bytes_sent: u64) void {
@@ -629,6 +663,18 @@ const Ship = struct {
         child.stderr_behavior = .Pipe;
         try child.spawn();
 
+        // store pid for stall detection kill
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.states[idx].child_pid = child.id;
+        }
+        defer {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.states[idx].child_pid = null;
+        }
+
         // open local file and stream to ssh stdin
         const local_file = try std.fs.cwd().openFile(self.config.local_path, .{});
         defer local_file.close();
@@ -674,45 +720,88 @@ const Ship = struct {
         gzip_child.stderr_behavior = .Pipe;
         try gzip_child.spawn();
 
+        // store pid for stall detection kill
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.states[idx].gzip_pid = gzip_child.id;
+        }
+        defer {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.states[idx].gzip_pid = null;
+        }
+
         const gzip_stdin = gzip_child.stdin.?;
         const gzip_stdout = gzip_child.stdout.?;
 
         // We need to handle this in a thread or use non-blocking I/O
         // For simplicity, spawn a thread to read from gzip and write to ssh
-        const ReadWriteContext = struct {
+        const WriterContext = struct {
             src: std.fs.File,
             dst: std.fs.File,
+            last_progress: *std.time.Instant,
+            mutex: *std.Thread.Mutex,
         };
 
+        var writer_last_progress = std.time.Instant.now() catch @panic("no clock");
+
         const writer_thread = try std.Thread.spawn(.{}, struct {
-            fn run(ctx: ReadWriteContext) void {
+            fn run(ctx: WriterContext) void {
                 var buf: [65536]u8 = undefined;
                 while (true) {
                     const n = ctx.src.read(&buf) catch break;
                     if (n == 0) break;
                     ctx.dst.writeAll(buf[0..n]) catch break;
+                    // update progress time - ssh accepted data
+                    if (std.time.Instant.now()) |now| {
+                        ctx.mutex.lock();
+                        ctx.last_progress.* = now;
+                        ctx.mutex.unlock();
+                    } else |_| {}
                 }
             }
-        }.run, .{ReadWriteContext{ .src = gzip_stdout, .dst = out }});
+        }.run, .{WriterContext{
+            .src = gzip_stdout,
+            .dst = out,
+            .last_progress = &writer_last_progress,
+            .mutex = &self.mutex,
+        }});
 
         // Stream file to gzip stdin with progress
         var buf: [65536]u8 = undefined;
         var total_read: u64 = 0;
+        var stream_err: ?anyerror = null;
 
         while (true) {
-            const n = try file.read(&buf);
+            const n = file.read(&buf) catch |e| {
+                stream_err = e;
+                break;
+            };
             if (n == 0) break;
-            try gzip_stdin.writeAll(buf[0..n]);
+            gzip_stdin.writeAll(buf[0..n]) catch |e| {
+                stream_err = e;
+                break;
+            };
             total_read += n;
 
             const progress: u8 = @intCast(@min(100, (total_read * 100) / self.local_size));
-            self.setProgress(idx, progress, total_read);
+            // use writer's progress time (tracks ssh, not gzip input)
+            {
+                self.mutex.lock();
+                self.states[idx].progress = progress;
+                self.states[idx].bytes_sent = total_read;
+                self.states[idx].last_progress_time = writer_last_progress;
+                self.mutex.unlock();
+            }
         }
         gzip_stdin.close();
         gzip_child.stdin = null;
 
         writer_thread.join();
-        _ = try gzip_child.wait();
+        _ = gzip_child.wait() catch {};
+
+        if (stream_err) |e| return e;
     }
 
     fn installFile(self: *Ship, idx: u32, spec: HostSpec, tmp_path: []const u8, dest: []const u8) !void {
@@ -808,7 +897,7 @@ const Ship = struct {
         }
     }
 
-    fn progressLoop(self: *Ship, threads: []std.Thread) !void {
+    fn progressLoop(self: *Ship, _: []std.Thread) !void {
         const stdout = std.fs.File.stdout();
         var all_done = false;
         var print_buf: [4096]u8 = undefined;
@@ -844,13 +933,12 @@ const Ship = struct {
         const show_summary = self.states.len > max_visible;
 
         // Print header row once
-        {
+        if (self.output_tty) {
             var pos: usize = 0;
             for (self.states[0..@min(self.states.len, max_visible)]) |state| {
                 const label = self.getHostLabel(state.spec);
                 const written = std.fmt.bufPrint(print_buf[pos..], "{s}", .{label}) catch break;
                 pos += written.len;
-                // Pad to column width
                 const pad = col_width - label.len;
                 @memset(print_buf[pos..][0..pad], ' ');
                 pos += pad;
@@ -896,9 +984,15 @@ const Ship = struct {
                         // Check for stall
                         const since_progress = now.since(state.last_progress_time);
                         if (since_progress > stall_ns) {
-                            state.status = .failed;
                             state.error_msg = "stalled";
-                            self.failed_count += 1;
+                            if (state.child_pid) |pid| {
+                                std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+                            }
+                            if (state.gzip_pid) |pid| {
+                                std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+                            }
+                            if (i > std.math.maxInt(u32)) @panic("host index overflow");
+                            self.setStatusLocked(@intCast(i), .failed);
                             break :blk "STALL";
                         }
                         // Calculate speed
@@ -958,15 +1052,10 @@ const Ship = struct {
                 pos += written.len;
             }
 
-            // ANSI clear to EOL
-            @memcpy(print_buf[pos..][0..3], "\x1b[K");
-            pos += 3;
-
-            stdout.writeAll(print_buf[0..pos]) catch {};
-
-            // check if threads still alive
-            for (threads) |t| {
-                _ = t.getHandle();
+            if (self.output_tty) {
+                @memcpy(print_buf[pos..][0..3], "\x1b[K");
+                pos += 3;
+                stdout.writeAll(print_buf[0..pos]) catch {};
             }
         }
     }
@@ -982,10 +1071,10 @@ const Ship = struct {
     }
 
     fn printFinalStatus(self: *Ship) !void {
+        if (!self.output_tty) return; // already printed via logFinalLocked
         const stdout = std.fs.File.stdout();
         stdout.writeAll("\n") catch {};
 
-        // print errors
         for (self.states) |state| {
             if (state.status == .failed) {
                 const label = self.getHostLabel(state.spec);

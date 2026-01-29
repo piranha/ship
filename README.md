@@ -105,6 +105,8 @@ OK         85% 24M    INS        +1✓ 0✗ 1↻
 
 Display auto-fits terminal width; excess hosts shown in summary.
 
+When stdout isn’t a TTY, ship prints one line per host on completion (e.g. `host1 OK`). Failures are listed with messages at the end.
+
 ## How It Works
 
 1. **MD5 check** - compare local MD5 with remote (skip if match)
