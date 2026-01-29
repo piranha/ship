@@ -337,11 +337,13 @@ const Ship = struct {
         const spec = state.spec;
         const dest = spec.dest orelse self.config.default_dest;
 
-        // md5 check
+        // probe remote: md5 check + fs info in single ssh call
+        self.setStatus(idx, .checking);
+        const probe = try self.probeRemote(spec, dest);
+
+        // skip if md5 matches
         if (!self.config.opts.skip_md5) {
-            self.setStatus(idx, .checking);
-            const remote_md5 = try self.getRemoteMd5(spec, dest);
-            if (remote_md5) |md5| {
+            if (probe.md5) |md5| {
                 if (std.mem.eql(u8, &md5, self.local_md5)) {
                     self.setStatus(idx, .skipped);
                     return;
@@ -351,9 +353,9 @@ const Ship = struct {
 
         // upload
         self.setStatus(idx, .uploading);
-        const tmp_path = try self.getTmpPath(spec, dest);
+        const tmp_path = try self.getTmpPath(probe.fs_info, dest);
         defer self.allocator.free(tmp_path);
-        try self.uploadFile(idx, spec, tmp_path);
+        try self.uploadFile(idx, spec, tmp_path, probe.has_gunzip);
 
         // install
         self.setStatus(idx, .installing);
@@ -471,47 +473,83 @@ const Ship = struct {
         return result;
     }
 
-    fn getRemoteMd5(self: *Ship, spec: HostSpec, dest: []const u8) !?[32]u8 {
+    const FsInfo = struct {
+        dest_dir: []const u8,
+        dest_dev: []const u8,
+        dest_free: u64,
+        dest_writable: bool,
+        home_dev: []const u8,
+        home_free: u64,
+        tmp_dev: []const u8,
+        tmp_free: u64,
+    };
+
+    const ProbeResult = struct {
+        md5: ?[32]u8,
+        fs_info: FsInfo,
+        has_gunzip: bool,
+    };
+
+    fn probeRemote(self: *Ship, spec: HostSpec, dest: []const u8) !ProbeResult {
         const escaped_dest = try escapeShellArg(self.allocator, dest);
         defer self.allocator.free(escaped_dest);
 
-        // try md5sum, then busybox md5sum
-        const cmd = try std.fmt.allocPrint(
-            self.allocator,
-            "md5sum {s} 2>/dev/null || busybox md5sum {s} 2>/dev/null",
-            .{ escaped_dest, escaped_dest },
-        );
-        defer self.allocator.free(cmd);
+        const dest_dir = std.fs.path.dirname(dest) orelse "/";
+        const escaped_dest_dir = try escapeShellArg(self.allocator, dest_dir);
+        defer self.allocator.free(escaped_dest_dir);
 
-        var result = try self.runSshCommand(spec, cmd);
+        const sudo_prefix = if (self.config.opts.sudo) self.config.opts.sudo_cmd else "";
+        const space = if (self.config.opts.sudo) " " else "";
+
+        // single ssh call: md5 + fs probe + gunzip check
+        var cmd_buf: [2048]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&cmd_buf,
+            \\m=$({s}{s}md5sum {s} 2>/dev/null || {s}{s}busybox md5sum {s} 2>/dev/null)
+            \\d={s}
+            \\dd=$(stat -c %d "$d" 2>/dev/null)
+            \\df=$(($(df -k "$d" 2>/dev/null | awk 'NR==2{{print $4}}')*1024))
+            \\dw=$(test -w "$d" && echo 1 || echo 0)
+            \\hd=$(stat -c %d ~ 2>/dev/null)
+            \\hf=$(($(df -k ~ 2>/dev/null | awk 'NR==2{{print $4}}')*1024))
+            \\td=$(stat -c %d /tmp 2>/dev/null)
+            \\tf=$(($(df -k /tmp 2>/dev/null | awk 'NR==2{{print $4}}')*1024))
+            \\gz=$(command -v gunzip >/dev/null 2>&1 || command -v busybox >/dev/null 2>&1 && echo 1 || echo 0)
+            \\echo "$m"
+            \\echo "$dd $df $dw $hd $hf $td $tf $gz"
+        , .{ sudo_prefix, space, escaped_dest, sudo_prefix, space, escaped_dest, escaped_dest_dir }) catch
+            return error.CommandTooLong;
+
+        const result = try self.runSshCommand(spec, cmd);
         defer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);
-        if (result.term.Exited == 0 and result.stdout.len >= 32) {
+
+        // parse output: first line is md5 (or empty), second line is fs info
+        var lines = std.mem.splitScalar(u8, std.mem.trimRight(u8, result.stdout, "\n"), '\n');
+        const md5_line = lines.next() orelse "";
+        const fs_line = lines.next() orelse "";
+
+        // parse md5 (first 32 chars if present)
+        const md5: ?[32]u8 = if (md5_line.len >= 32) blk: {
             var md5: [32]u8 = undefined;
-            @memcpy(&md5, result.stdout[0..32]);
-            return md5;
-        }
+            @memcpy(&md5, md5_line[0..32]);
+            break :blk md5;
+        } else null;
 
-        // try with sudo if enabled
-        if (self.config.opts.sudo) {
-            const sudo_cmd = try std.fmt.allocPrint(
-                self.allocator,
-                "{s} md5sum {s} 2>/dev/null || {s} busybox md5sum {s} 2>/dev/null",
-                .{ self.config.opts.sudo_cmd, escaped_dest, self.config.opts.sudo_cmd, escaped_dest },
-            );
-            defer self.allocator.free(sudo_cmd);
+        // parse fs info
+        var it = std.mem.splitScalar(u8, fs_line, ' ');
+        const fs_info = FsInfo{
+            .dest_dir = dest_dir,
+            .dest_dev = it.next() orelse "",
+            .dest_free = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0,
+            .dest_writable = std.mem.eql(u8, it.next() orelse "0", "1"),
+            .home_dev = it.next() orelse "",
+            .home_free = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0,
+            .tmp_dev = it.next() orelse "",
+            .tmp_free = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0,
+        };
+        const has_gunzip = std.mem.eql(u8, it.next() orelse "0", "1");
 
-            var sudo_result = try self.runSshCommand(spec, sudo_cmd);
-            defer self.allocator.free(sudo_result.stdout);
-            defer self.allocator.free(sudo_result.stderr);
-            if (sudo_result.term.Exited == 0 and sudo_result.stdout.len >= 32) {
-                var md5: [32]u8 = undefined;
-                @memcpy(&md5, sudo_result.stdout[0..32]);
-                return md5;
-            }
-        }
-
-        return null;
+        return .{ .md5 = md5, .fs_info = fs_info, .has_gunzip = has_gunzip };
     }
 
     fn runSshCommand(self: *Ship, spec: HostSpec, remote_cmd: []const u8) !std.process.Child.RunResult {
@@ -526,7 +564,7 @@ const Ship = struct {
         return result;
     }
 
-    fn getTmpPath(self: *Ship, spec: HostSpec, dest: []const u8) ![]const u8 {
+    fn getTmpPath(self: *Ship, fs_info: FsInfo, dest: []const u8) ![]const u8 {
         // if --tmp explicitly set, use it directly (exact path, no checks)
         if (self.config.opts.tmp) |p| {
             return self.allocator.dupe(u8, p);
@@ -534,91 +572,51 @@ const Ship = struct {
 
         const basename = std.fs.path.basename(self.config.local_path);
         const pid = std.os.linux.getpid();
-        const dest_dir = std.fs.path.dirname(dest) orelse "/";
 
         // build temp filename
         var tmp_name_buf: [256]u8 = undefined;
         const tmp_name = std.fmt.bufPrint(&tmp_name_buf, ".ship.{s}.{d}.tmp", .{ basename, pid }) catch
             return error.TmpPathTooLong;
 
-        // query remote for best temp location
-        const escaped_dest_dir = try escapeShellArg(self.allocator, dest_dir);
-        defer self.allocator.free(escaped_dest_dir);
-
-        // single ssh call to probe remote filesystem
-        // returns: dest_dev dest_free dest_writable home_dev home_free tmp_dev tmp_free
-        // note: busybox df doesn't support -B1, use -k and multiply
-        var probe_buf: [1024]u8 = undefined;
-        const probe_cmd = std.fmt.bufPrint(&probe_buf,
-            \\d={s}
-            \\dd=$(stat -c %d "$d" 2>/dev/null)
-            \\df=$(($(df -k "$d" 2>/dev/null | awk 'NR==2{{print $4}}')*1024))
-            \\dw=$(test -w "$d" && echo 1 || echo 0)
-            \\hd=$(stat -c %d ~ 2>/dev/null)
-            \\hf=$(($(df -k ~ 2>/dev/null | awk 'NR==2{{print $4}}')*1024))
-            \\td=$(stat -c %d /tmp 2>/dev/null)
-            \\tf=$(($(df -k /tmp 2>/dev/null | awk 'NR==2{{print $4}}')*1024))
-            \\echo "$dd $df $dw $hd $hf $td $tf"
-        , .{escaped_dest_dir}) catch return error.TmpPathTooLong;
-
-        const result = try self.runSshCommand(spec, probe_cmd);
-        defer self.allocator.free(result.stdout);
-        defer self.allocator.free(result.stderr);
-
-        // parse output: dest_dev dest_free dest_writable home_dev home_free tmp_dev tmp_free
-        var it = std.mem.splitScalar(u8, std.mem.trimRight(u8, result.stdout, "\n"), ' ');
-        const dest_dev = it.next() orelse "";
-        const dest_free = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0;
-        const dest_writable = std.mem.eql(u8, it.next() orelse "0", "1");
-        const home_dev = it.next() orelse "";
-        const home_free = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0;
-        const tmp_dev = it.next() orelse "";
-        const tmp_free = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0;
-
         const size_needed = self.local_size + 1024 * 1024; // 1MB margin
+        const dest_dir = std.fs.path.dirname(dest) orelse "/";
 
         // pick best location: dest dir > home > /tmp
         const tmp_dir: []const u8 = blk: {
-            if (dest_writable and dest_free >= size_needed) {
+            if (fs_info.dest_writable and fs_info.dest_free >= size_needed) {
                 break :blk dest_dir;
             }
-            if (std.mem.eql(u8, home_dev, dest_dev) and home_free >= size_needed) {
+            if (std.mem.eql(u8, fs_info.home_dev, fs_info.dest_dev) and fs_info.home_free >= size_needed) {
                 break :blk "~";
             }
-            if (std.mem.eql(u8, tmp_dev, dest_dev) and tmp_free >= size_needed) {
+            if (std.mem.eql(u8, fs_info.tmp_dev, fs_info.dest_dev) and fs_info.tmp_free >= size_needed) {
                 break :blk "/tmp";
             }
             // fallback: prefer same-fs even without dest write permission (sudo will handle)
-            if (std.mem.eql(u8, home_dev, dest_dev) and home_free >= size_needed) {
+            if (std.mem.eql(u8, fs_info.home_dev, fs_info.dest_dev) and fs_info.home_free >= size_needed) {
                 break :blk "~";
             }
-            if (std.mem.eql(u8, tmp_dev, dest_dev) and tmp_free >= size_needed) {
+            if (std.mem.eql(u8, fs_info.tmp_dev, fs_info.dest_dev) and fs_info.tmp_free >= size_needed) {
                 break :blk "/tmp";
             }
             // last resort: any location with space (mv will copy across fs)
-            if (dest_writable and dest_free >= size_needed) break :blk dest_dir;
-            if (home_free >= size_needed) break :blk "~";
-            if (tmp_free >= size_needed) break :blk "/tmp";
+            if (fs_info.dest_writable and fs_info.dest_free >= size_needed) break :blk dest_dir;
+            if (fs_info.home_free >= size_needed) break :blk "~";
+            if (fs_info.tmp_free >= size_needed) break :blk "/tmp";
             return error.NoSpaceOnRemote;
         };
 
         return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ tmp_dir, tmp_name });
     }
 
-    fn uploadFile(self: *Ship, idx: u32, spec: HostSpec, tmp_path: []const u8) !void {
+    fn uploadFile(self: *Ship, idx: u32, spec: HostSpec, tmp_path: []const u8, has_gunzip: bool) !void {
         const escaped_tmp = try escapeShellArg(self.allocator, tmp_path);
         defer self.allocator.free(escaped_tmp);
 
-        // check if remote has gunzip (for auto mode)
+        // determine if we should compress
         var actually_compress = self.use_compression;
-        if (self.config.opts.compress == .auto and self.use_compression) {
-            const check_cmd = "command -v gunzip >/dev/null 2>&1 || command -v busybox >/dev/null 2>&1";
-            const result = try self.runSshCommand(spec, check_cmd);
-            defer self.allocator.free(result.stdout);
-            defer self.allocator.free(result.stderr);
-            if (result.term.Exited != 0) {
-                actually_compress = false;
-            }
+        if (self.config.opts.compress == .auto and self.use_compression and !has_gunzip) {
+            actually_compress = false;
         }
 
         const remote_cmd = if (actually_compress)
