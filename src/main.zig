@@ -293,6 +293,9 @@ const Ship = struct {
     }
 
     fn deinit(self: *Ship) void {
+        for (self.states) |state| {
+            if (state.error_msg) |msg| self.allocator.free(msg);
+        }
         self.allocator.free(self.local_md5);
         self.allocator.free(self.states);
         self.allocator.free(self.config.hosts);
@@ -352,11 +355,8 @@ const Ship = struct {
                 next_host.* += 1;
             }
             self.processHost(idx) catch |err| {
-                self.mutex.lock();
-                defer self.mutex.unlock();
-                if (self.states[idx].error_msg == null)
-                    self.states[idx].error_msg = friendlyError(err);
-                self.setStatusLocked(idx, .failed);
+                _ = self.setErrorMsg(idx, friendlyError(err));
+                self.setStatus(idx, .failed);
             };
         }
     }
@@ -368,7 +368,7 @@ const Ship = struct {
 
         // probe remote: md5 check + fs info in single ssh call
         self.setStatus(idx, .checking);
-        const probe = try self.probeRemote(spec, dest);
+        const probe = try self.probeRemote(idx, spec, dest);
 
         // skip if md5 matches
         if (!self.config.opts.skip_md5) {
@@ -534,7 +534,7 @@ const Ship = struct {
         has_gunzip: bool,
     };
 
-    fn probeRemote(self: *Ship, spec: HostSpec, dest: []const u8) !ProbeResult {
+    fn probeRemote(self: *Ship, idx: u32, spec: HostSpec, dest: []const u8) !ProbeResult {
         const escaped_dest = try escapeShellArg(self.allocator, dest);
         defer self.allocator.free(escaped_dest);
 
@@ -572,7 +572,16 @@ const Ship = struct {
             .Exited => |code| code == 0,
             else => false,
         };
-        if (!ssh_ok or result.stdout.len == 0) return error.ProbeFailed;
+        if (!ssh_ok or result.stdout.len == 0) {
+            if (result.stderr.len > 0) {
+                const first_line = if (std.mem.indexOf(u8, result.stderr, "\n")) |nl|
+                    result.stderr[0..nl]
+                else
+                    result.stderr;
+                _ = self.setErrorMsg(idx, first_line);
+            }
+            return error.ProbeFailed;
+        }
 
         // parse output: first line is md5 (or empty), second line is fs info
         var lines = std.mem.splitScalar(u8, std.mem.trimRight(u8, result.stdout, "\n"), '\n');
