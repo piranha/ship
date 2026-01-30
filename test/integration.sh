@@ -110,12 +110,20 @@ REMOTE_MD5=$(ssh_cmd $TEST_HOST1_PORT "md5sum $DEST" | cut -d' ' -f1)
 [ "$LARGE_MD5" = "$REMOTE_MD5" ] && pass "compression" || fail "md5 mismatch after compression"
 ssh_cmd $TEST_HOST1_PORT "rm -f $DEST"
 
-# Test 7: Unreachable host (timeout)
-echo "Test 7: Unreachable host handling"
+# Test 7: Unreachable host (connection refused)
+echo "Test 7: Connection refused error"
 DEST="/tmp/ship_test_7"
-OUTPUT=$($SHIP "--ssh-opts=$SSH_OPTS -o ConnectTimeout=1" --port 17799 --skip-md5 --compress=off \
+OUTPUT=$($SHIP "--ssh-opts=-o BatchMode=yes -o ConnectTimeout=1" --port 17799 --skip-md5 --compress=off \
     "$TEST_FILE:$DEST" 127.0.0.1 2>&1) || true
-echo "$OUTPUT" | grep -q "ERR" && pass "unreachable host shows ERR" || fail "expected ERR"
+echo "$OUTPUT" | grep -qi "connection refused\|ERR" && pass "connection refused" || fail "expected connection error, got: $OUTPUT"
+
+# Test 7b: Auth failure (wrong key)
+echo "Test 7b: Auth failure error"
+DEST="/tmp/ship_test_7b"
+# Use a non-existent key to trigger auth failure
+OUTPUT=$($SHIP "--ssh-opts=-o BatchMode=yes -o ConnectTimeout=2 -i /nonexistent/key" --port $TEST_HOST1_PORT --skip-md5 --compress=off \
+    "$TEST_FILE:$DEST" 127.0.0.1 2>&1) || true
+echo "$OUTPUT" | grep -qi "permission denied\|denied\|ERR" && pass "auth failure" || fail "expected auth error, got: $OUTPUT"
 
 # Test 8: Restart command
 echo "Test 8: Restart command"
