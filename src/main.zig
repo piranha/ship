@@ -550,6 +550,13 @@ const Ship = struct {
         defer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);
 
+        // check SSH succeeded
+        const ssh_ok = switch (result.term) {
+            .Exited => |code| code == 0,
+            else => false,
+        };
+        if (!ssh_ok or result.stdout.len == 0) return error.ProbeFailed;
+
         // parse output: first line is md5 (or empty), second line is fs info
         var lines = std.mem.splitScalar(u8, std.mem.trimRight(u8, result.stdout, "\n"), '\n');
         const md5_line = lines.next() orelse "";
