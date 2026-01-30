@@ -930,11 +930,7 @@ const Ship = struct {
                     result.stderr;
                 if (first_line.len > 0) {
                     std.debug.print("\n{s}: {s}\n", .{ spec.host, first_line });
-                    if (self.allocator.dupe(u8, first_line)) |msg| {
-                        self.mutex.lock();
-                        self.states[idx].error_msg = msg;
-                        self.mutex.unlock();
-                    } else |_| {}
+                    _ = self.setErrorMsg(idx, first_line);
                 }
             }
             // check for sudo password prompt hint
@@ -1060,7 +1056,7 @@ const Ship = struct {
                         // Check for stall
                         const since_progress = now.since(state.last_progress_time);
                         if (since_progress > stall_ns) {
-                            state.error_msg = "stalled";
+                            _ = self.setErrorMsg(@intCast(i), "stalled");
                             if (state.child_pid) |pid| {
                                 std.posix.kill(pid, std.posix.SIG.KILL) catch {};
                             }
