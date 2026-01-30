@@ -21,6 +21,15 @@
 - **Tests**: Never weaken thresholds to pass. Fix problems or document why expected.
 - **CLI**: kebab-case only (`--radio-port` not `--radio_port`)
 
+## Testing
+- `make test` - runs unit tests + integration tests with sanitizers enabled
+- `test/setup.sh` - spins up 3 local sshd instances on ports 17722-17724
+- `test/integration.sh` - black-box tests against local sshds
+- `test/teardown.sh` - cleanup
+- Build with `-Dsanitize=true` for address sanitizer + valgrind instrumentation
+- Integration tests use `--opt=value` syntax (not `--opt value`) for args starting with `-`
+- Test 10 exercises sudo path with non-writable dest - catches FsInfo lifetime bugs
+
 ## Zig 0.15
 
 Incomplete list - add entries when agent slip-ups occur.
