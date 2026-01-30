@@ -4,6 +4,23 @@ const opt = @import("opt");
 
 const CompressMode = enum { auto, on, off };
 
+fn friendlyError(err: anyerror) []const u8 {
+    return switch (err) {
+        error.ProbeFailed => "SSH probe failed (connection or auth error)",
+        error.NoSpaceOnRemote => "no space on remote filesystem",
+        error.UploadFailed => "upload failed",
+        error.InstallFailed => "install failed (mv/chmod)",
+        error.RestartFailed => "restart command failed",
+        error.SudoRequiresPassword => "sudo requires password (use NOPASSWD or -n)",
+        error.CommandTooLong => "internal: command too long",
+        error.FileNotFound => "local file not found",
+        error.AccessDenied => "permission denied",
+        error.ConnectionRefused => "connection refused",
+        error.ConnectionTimedOut, error.ConnectionResetByPeer => "connection failed",
+        else => @errorName(err),
+    };
+}
+
 const Options = struct {
     jobs: u32 = 8,
     ssh: []const u8 = "ssh",
@@ -338,7 +355,7 @@ const Ship = struct {
                 self.mutex.lock();
                 defer self.mutex.unlock();
                 if (self.states[idx].error_msg == null)
-                    self.states[idx].error_msg = @errorName(err);
+                    self.states[idx].error_msg = friendlyError(err);
                 self.setStatusLocked(idx, .failed);
             };
         }
