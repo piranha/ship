@@ -119,6 +119,7 @@ const HostState = struct {
     error_msg: ?[]const u8,
     child_pid: ?std.posix.pid_t, // for killing on stall
     gzip_pid: ?std.posix.pid_t, // for killing on stall (compression)
+    control_path: ?[]const u8, // SSH ControlMaster socket path
 };
 
 fn parseHostSpec(spec: []const u8) HostSpec {
@@ -287,14 +288,19 @@ const Ship = struct {
                 .error_msg = null,
                 .child_pid = null,
                 .gzip_pid = null,
+                .control_path = null,
             };
         }
         return ship;
     }
 
     fn deinit(self: *Ship) void {
-        for (self.states) |state| {
+        for (self.states, 0..) |state, i| {
             if (state.error_msg) |msg| self.allocator.free(msg);
+            if (state.control_path) |path| {
+                self.closeControlMaster(@intCast(i));
+                self.allocator.free(path);
+            }
         }
         self.allocator.free(self.local_md5);
         self.allocator.free(self.states);
@@ -366,6 +372,12 @@ const Ship = struct {
         const spec = state.spec;
         const dest = spec.dest orelse self.config.default_dest;
 
+        // small stagger to avoid thundering herd on sshd
+        if (idx > 0) std.Thread.sleep(@as(u64, idx) * 50_000_000); // 50ms per host
+
+        // establish control master for connection multiplexing
+        self.startControlMaster(idx, spec) catch {}; // best effort, falls back to normal ssh
+
         // probe remote: md5 check + fs info in single ssh call
         self.setStatus(idx, .checking);
         const probe = try self.probeRemote(idx, spec, dest);
@@ -393,7 +405,7 @@ const Ship = struct {
         // restart
         if (self.config.opts.restart) |cmd| {
             self.setStatus(idx, .restarting);
-            try self.runRestart(spec, cmd);
+            try self.runRestart(idx, spec, cmd);
         }
 
         self.setStatus(idx, .done);
@@ -478,7 +490,7 @@ const Ship = struct {
         }
     };
 
-    fn buildSshArgs(self: *Ship, spec: HostSpec) !SshArgs {
+    fn buildSshArgs(self: *Ship, idx: u32, spec: HostSpec) !SshArgs {
         var result = SshArgs{
             .args = .{},
             .port_str = null,
@@ -501,6 +513,12 @@ const Ship = struct {
         try result.args.append(self.allocator, result.timeout_str.?);
         try result.args.append(self.allocator, "-oServerAliveCountMax=1");
 
+        // Add ControlPath for connection multiplexing
+        if (self.states[idx].control_path) |cp| {
+            try result.args.append(self.allocator, "-oControlPath");
+            try result.args.append(self.allocator, cp);
+        }
+
         if (self.config.opts.port) |port| {
             try result.args.append(self.allocator, "-p");
             result.port_str = try std.fmt.allocPrint(self.allocator, "{d}", .{port});
@@ -515,6 +533,91 @@ const Ship = struct {
 
         try result.args.append(self.allocator, spec.host);
         return result;
+    }
+
+    fn startControlMaster(self: *Ship, idx: u32, spec: HostSpec) !void {
+        const pid = std.os.linux.getpid();
+        const control_path = try std.fmt.allocPrint(self.allocator, "/tmp/.ship-{d}-{s}.sock", .{ pid, spec.host });
+        errdefer self.allocator.free(control_path);
+
+        // Build args for master connection
+        var args: std.ArrayList([]const u8) = .{};
+        defer args.deinit(self.allocator);
+
+        try args.append(self.allocator, self.config.opts.ssh);
+
+        // parse ssh_opts
+        var it = std.mem.splitScalar(u8, self.config.opts.ssh_opts, ' ');
+        while (it.next()) |o| {
+            if (o.len > 0) try args.append(self.allocator, o);
+        }
+
+        // ControlMaster options - use ControlPersist=10s so master auto-exits
+        // shortly after ship completes (or gets killed)
+        try args.append(self.allocator, "-oControlMaster=auto");
+        try args.append(self.allocator, "-oControlPath");
+        try args.append(self.allocator, control_path);
+        try args.append(self.allocator, "-oControlPersist=10");
+
+        if (self.config.opts.port) |port| {
+            try args.append(self.allocator, "-p");
+            var port_buf: [8]u8 = undefined;
+            const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
+            try args.append(self.allocator, port_str);
+        }
+
+        const user = spec.user orelse self.config.opts.user;
+        if (user) |u| {
+            try args.append(self.allocator, "-l");
+            try args.append(self.allocator, u);
+        }
+
+        try args.append(self.allocator, spec.host);
+        try args.append(self.allocator, "true"); // quick command to establish master
+
+        // Retry a few times - transient connection resets are common with parallel connects
+        var attempt: u32 = 0;
+        while (attempt < 3) : (attempt += 1) {
+            if (attempt > 0) std.Thread.sleep(500_000_000); // 500ms backoff
+
+            var child = std.process.Child.init(args.items, self.allocator);
+            child.stdin_behavior = .Ignore;
+            child.stdout_behavior = .Ignore;
+            child.stderr_behavior = .Ignore;
+
+            const term = child.spawnAndWait() catch continue;
+            if (term.Exited != 0) continue;
+
+            // Verify socket exists
+            std.fs.accessAbsolute(control_path, .{}) catch continue;
+            self.states[idx].control_path = control_path;
+            return;
+        }
+        return error.ControlMasterFailed;
+    }
+
+    fn closeControlMaster(self: *Ship, idx: u32) void {
+        const control_path = self.states[idx].control_path orelse return;
+
+        // Send exit command to control master
+        var args = [_][]const u8{
+            self.config.opts.ssh,
+            "-oControlPath",
+            control_path,
+            "-O",
+            "exit",
+            self.states[idx].spec.host,
+        };
+
+        var child = std.process.Child.init(&args, self.allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        child.spawn() catch return;
+        _ = child.wait() catch {};
+
+        // Remove socket file
+        std.fs.deleteFileAbsolute(control_path) catch {};
     }
 
     const FsInfo = struct {
@@ -563,7 +666,7 @@ const Ship = struct {
         , .{ sudo_prefix, space, escaped_dest, sudo_prefix, space, escaped_dest, escaped_dest_dir }) catch
             return error.CommandTooLong;
 
-        const result = try self.runSshCommand(spec, cmd);
+        const result = try self.runSshCommand(idx, spec, cmd);
         defer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);
 
@@ -612,8 +715,8 @@ const Ship = struct {
         return .{ .md5 = md5, .fs_info = fs_info, .has_gunzip = has_gunzip };
     }
 
-    fn runSshCommand(self: *Ship, spec: HostSpec, remote_cmd: []const u8) !std.process.Child.RunResult {
-        var ssh_args = try self.buildSshArgs(spec);
+    fn runSshCommand(self: *Ship, idx: u32, spec: HostSpec, remote_cmd: []const u8) !std.process.Child.RunResult {
+        var ssh_args = try self.buildSshArgs(idx, spec);
         defer ssh_args.deinit();
         try ssh_args.args.append(self.allocator, remote_cmd);
 
@@ -685,7 +788,7 @@ const Ship = struct {
             try std.fmt.allocPrint(self.allocator, "cat > {s}", .{escaped_tmp});
         defer self.allocator.free(remote_cmd);
 
-        var ssh_args = try self.buildSshArgs(spec);
+        var ssh_args = try self.buildSshArgs(idx, spec);
         defer ssh_args.deinit();
         try ssh_args.args.append(self.allocator, remote_cmd);
 
@@ -918,7 +1021,7 @@ const Ship = struct {
         // mv
         pos += (std.fmt.bufPrint(cmd_buf[pos..], "{s}{s}mv {s} {s}", .{ sudo_prefix, space, escaped_tmp, escaped_dest }) catch unreachable).len;
 
-        const result = try self.runSshCommand(spec, cmd_buf[0..pos]);
+        const result = try self.runSshCommand(idx, spec, cmd_buf[0..pos]);
         defer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);
         if (result.term.Exited != 0) {
@@ -943,7 +1046,7 @@ const Ship = struct {
             if (!self.config.opts.keep_tmp_on_fail) {
                 const cleanup = try std.fmt.allocPrint(self.allocator, "rm -f {s}", .{escaped_tmp});
                 defer self.allocator.free(cleanup);
-                const cleanup_result = self.runSshCommand(spec, cleanup) catch return error.InstallFailed;
+                const cleanup_result = self.runSshCommand(idx, spec, cleanup) catch return error.InstallFailed;
                 self.allocator.free(cleanup_result.stdout);
                 self.allocator.free(cleanup_result.stderr);
             }
@@ -951,7 +1054,7 @@ const Ship = struct {
         }
     }
 
-    fn runRestart(self: *Ship, spec: HostSpec, cmd: []const u8) !void {
+    fn runRestart(self: *Ship, idx: u32, spec: HostSpec, cmd: []const u8) !void {
         const escaped_cmd = try escapeShellArg(self.allocator, cmd);
         defer self.allocator.free(escaped_cmd);
 
@@ -961,7 +1064,7 @@ const Ship = struct {
             cmd;
         defer if (self.config.opts.sudo) self.allocator.free(remote_cmd);
 
-        const result = try self.runSshCommand(spec, remote_cmd);
+        const result = try self.runSshCommand(idx, spec, remote_cmd);
         defer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);
         if (result.term.Exited != 0) {
