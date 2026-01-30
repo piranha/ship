@@ -10,8 +10,8 @@ clean:
 	rm -rf zig-out .zig-cache
 
 test:
-	zig build test
-	zig build
+	zig build test -Dsanitize=true
+	zig build -Dsanitize=true
 	@./test/setup.sh
 	@./test/integration.sh
 	@./test/teardown.sh

@@ -7,7 +7,7 @@ const CompressMode = enum { auto, on, off };
 const Options = struct {
     jobs: u32 = 8,
     ssh: []const u8 = "ssh",
-    ssh_opts: []const u8 = "-oBatchMode=yes -oConnectTimeout=5",
+    ssh_opts: []const u8 = "-T -oBatchMode=yes -oConnectTimeout=5",
     port: ?u16 = null,
     user: ?[]const u8 = null,
     skip_md5: bool = false,
@@ -499,12 +499,12 @@ const Ship = struct {
 
     const FsInfo = struct {
         dest_dir: []const u8,
-        dest_dev: []const u8,
+        dest_dev: u64,
         dest_free: u64,
         dest_writable: bool,
-        home_dev: []const u8,
+        home_dev: u64,
         home_free: u64,
-        tmp_dev: []const u8,
+        tmp_dev: u64,
         tmp_free: u64,
     };
 
@@ -563,12 +563,12 @@ const Ship = struct {
         var it = std.mem.splitScalar(u8, fs_line, ' ');
         const fs_info = FsInfo{
             .dest_dir = dest_dir,
-            .dest_dev = it.next() orelse "",
+            .dest_dev = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0,
             .dest_free = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0,
             .dest_writable = std.mem.eql(u8, it.next() orelse "0", "1"),
-            .home_dev = it.next() orelse "",
+            .home_dev = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0,
             .home_free = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0,
-            .tmp_dev = it.next() orelse "",
+            .tmp_dev = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0,
             .tmp_free = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0,
         };
         const has_gunzip = std.mem.eql(u8, it.next() orelse "0", "1");
@@ -610,17 +610,17 @@ const Ship = struct {
             if (fs_info.dest_writable and fs_info.dest_free >= size_needed) {
                 break :blk dest_dir;
             }
-            if (std.mem.eql(u8, fs_info.home_dev, fs_info.dest_dev) and fs_info.home_free >= size_needed) {
+            if (fs_info.home_dev == fs_info.dest_dev and fs_info.home_free >= size_needed) {
                 break :blk "~";
             }
-            if (std.mem.eql(u8, fs_info.tmp_dev, fs_info.dest_dev) and fs_info.tmp_free >= size_needed) {
+            if (fs_info.tmp_dev == fs_info.dest_dev and fs_info.tmp_free >= size_needed) {
                 break :blk "/tmp";
             }
             // fallback: prefer same-fs even without dest write permission (sudo will handle)
-            if (std.mem.eql(u8, fs_info.home_dev, fs_info.dest_dev) and fs_info.home_free >= size_needed) {
+            if (fs_info.home_dev == fs_info.dest_dev and fs_info.home_free >= size_needed) {
                 break :blk "~";
             }
-            if (std.mem.eql(u8, fs_info.tmp_dev, fs_info.dest_dev) and fs_info.tmp_free >= size_needed) {
+            if (fs_info.tmp_dev == fs_info.dest_dev and fs_info.tmp_free >= size_needed) {
                 break :blk "/tmp";
             }
             // last resort: any location with space (mv will copy across fs)

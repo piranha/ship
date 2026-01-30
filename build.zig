@@ -4,6 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "Strip debug info from binary") orelse false;
+    const sanitize = b.option(bool, "sanitize", "Enable address sanitizer") orelse false;
     const version = b.option([]const u8, "version", "Version string") orelse "dev";
     const output = b.option([]const u8, "output", "Custom output path (e.g., dist/ship-Linux-x86_64)");
 
@@ -17,6 +18,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .strip = strip,
+        .sanitize_c = if (sanitize) .full else null,
+        .valgrind = if (sanitize) true else null,
         .imports = &.{
             .{ .name = "opt", .module = opt_dep.module("opt") },
         },
@@ -48,6 +51,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_c = if (sanitize) .full else null,
+        .valgrind = if (sanitize) true else null,
         .imports = &.{
             .{ .name = "opt", .module = opt_dep.module("opt") },
         },
