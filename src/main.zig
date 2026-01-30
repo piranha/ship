@@ -72,6 +72,7 @@ const Config = struct {
     default_dest: []const u8,
     hosts: []HostSpec,
     opts: Options,
+    args: []const [:0]u8, // keep for freeing
 };
 
 const HostSpec = struct {
@@ -136,8 +137,8 @@ fn printUsage() void {
 }
 
 fn parseArgs(allocator: std.mem.Allocator) !?Config {
-    // NOTE: don't free args - strings are borrowed into Config
     const args = try std.process.argsAlloc(allocator);
+    errdefer std.process.argsFree(allocator, args);
 
     var opts = Options{};
     const positionals = opt.parse(Options, &opts, args[1..]) catch |e| {
@@ -184,6 +185,7 @@ fn parseArgs(allocator: std.mem.Allocator) !?Config {
         .default_dest = default_dest,
         .hosts = try hosts.toOwnedSlice(allocator),
         .opts = opts,
+        .args = args,
     };
 }
 
@@ -277,6 +279,7 @@ const Ship = struct {
         self.allocator.free(self.local_md5);
         self.allocator.free(self.states);
         self.allocator.free(self.config.hosts);
+        std.process.argsFree(self.allocator, self.config.args);
         self.allocator.destroy(self);
     }
 
