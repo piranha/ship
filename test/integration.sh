@@ -161,5 +161,65 @@ REMOTE_MD5=$(ssh_cmd $TEST_HOST1_PORT "sudo md5sum $DEST" | cut -d' ' -f1)
 [ "$TEST_MD5" = "$REMOTE_MD5" ] && pass "sudo non-writable dest" || fail "md5 mismatch"
 ssh_cmd $TEST_HOST1_PORT "sudo rm -rf $PROTECTED_DIR"
 
+# Test 11: SSH dies mid-transfer with compression (deadlock prevention)
+echo "Test 11: SSH death mid-transfer with compression"
+# Create a larger file so transfer takes time
+BIG_FILE="$WORK_DIR/bigfile.bin"
+dd if=/dev/urandom of="$BIG_FILE" bs=1024 count=2048 2>/dev/null  # 2MB random
+DEST="/tmp/ship_test_11"
+
+# Start ship in background, kill ssh after brief delay
+$SHIP "$SHIP_SSH_OPTS" --port $TEST_HOST1_PORT --skip-md5 --compress=on \
+    "$BIG_FILE:$DEST" 127.0.0.1 --quiet 2>&1 &
+SHIP_PID=$!
+
+# Wait a bit for transfer to start, then kill ssh children
+sleep 0.3
+# Kill any ssh processes that are children of ship
+pkill -P $SHIP_PID -f ssh 2>/dev/null || true
+
+# Ship should exit within timeout (not hang)
+TIMEOUT=5
+ELAPSED=0
+while kill -0 $SHIP_PID 2>/dev/null; do
+    sleep 0.1
+    ELAPSED=$(echo "$ELAPSED + 0.1" | bc)
+    if [ "$(echo "$ELAPSED > $TIMEOUT" | bc)" -eq 1 ]; then
+        kill -9 $SHIP_PID 2>/dev/null || true
+        fail "ship hung after ssh killed (deadlock)"
+    fi
+done
+
+# Ship should have exited (with error, that's ok)
+wait $SHIP_PID 2>/dev/null || true
+pass "ssh death mid-transfer (no deadlock)"
+ssh_cmd $TEST_HOST1_PORT "rm -f $DEST" 2>/dev/null || true
+
+# Test 12: SSH dies mid-transfer without compression
+echo "Test 12: SSH death mid-transfer without compression"
+DEST="/tmp/ship_test_12"
+
+$SHIP "$SHIP_SSH_OPTS" --port $TEST_HOST1_PORT --skip-md5 --compress=off \
+    "$BIG_FILE:$DEST" 127.0.0.1 --quiet 2>&1 &
+SHIP_PID=$!
+
+sleep 0.3
+pkill -P $SHIP_PID -f ssh 2>/dev/null || true
+
+TIMEOUT=5
+ELAPSED=0
+while kill -0 $SHIP_PID 2>/dev/null; do
+    sleep 0.1
+    ELAPSED=$(echo "$ELAPSED + 0.1" | bc)
+    if [ "$(echo "$ELAPSED > $TIMEOUT" | bc)" -eq 1 ]; then
+        kill -9 $SHIP_PID 2>/dev/null || true
+        fail "ship hung after ssh killed (no compression)"
+    fi
+done
+
+wait $SHIP_PID 2>/dev/null || true
+pass "ssh death without compression (no deadlock)"
+ssh_cmd $TEST_HOST1_PORT "rm -f $DEST" 2>/dev/null || true
+
 echo ""
 echo "=== All tests passed ==="
