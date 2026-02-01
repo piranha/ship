@@ -481,11 +481,13 @@ const Ship = struct {
         args: std.ArrayList([]const u8),
         port_str: ?[]const u8,
         timeout_str: ?[]const u8,
+        cp_str: ?[]const u8,
         allocator: std.mem.Allocator,
 
         fn deinit(self: *SshArgs) void {
             if (self.port_str) |p| self.allocator.free(p);
             if (self.timeout_str) |t| self.allocator.free(t);
+            if (self.cp_str) |c| self.allocator.free(c);
             self.args.deinit(self.allocator);
         }
     };
@@ -495,6 +497,7 @@ const Ship = struct {
             .args = .{},
             .port_str = null,
             .timeout_str = null,
+            .cp_str = null,
             .allocator = self.allocator,
         };
         errdefer result.deinit();
@@ -515,8 +518,8 @@ const Ship = struct {
 
         // Add ControlPath for connection multiplexing
         if (self.states[idx].control_path) |cp| {
-            try result.args.append(self.allocator, "-oControlPath");
-            try result.args.append(self.allocator, cp);
+            result.cp_str = try std.fmt.allocPrint(self.allocator, "-oControlPath={s}", .{cp});
+            try result.args.append(self.allocator, result.cp_str.?);
         }
 
         if (self.config.opts.port) |port| {
@@ -554,9 +557,10 @@ const Ship = struct {
 
         // ControlMaster options - use ControlPersist=10s so master auto-exits
         // shortly after ship completes (or gets killed)
-        try args.append(self.allocator, "-oControlMaster=auto");
-        try args.append(self.allocator, "-oControlPath");
-        try args.append(self.allocator, control_path);
+        try args.append(self.allocator, "-oControlMaster=yes");
+        const cp_opt = try std.fmt.allocPrint(self.allocator, "-oControlPath={s}", .{control_path});
+        defer self.allocator.free(cp_opt);
+        try args.append(self.allocator, cp_opt);
         try args.append(self.allocator, "-oControlPersist=10");
 
         if (self.config.opts.port) |port| {
@@ -599,11 +603,14 @@ const Ship = struct {
     fn closeControlMaster(self: *Ship, idx: u32) void {
         const control_path = self.states[idx].control_path orelse return;
 
+        // Build -oControlPath=... option
+        const cp_opt = std.fmt.allocPrint(self.allocator, "-oControlPath={s}", .{control_path}) catch return;
+        defer self.allocator.free(cp_opt);
+
         // Send exit command to control master
         var args = [_][]const u8{
             self.config.opts.ssh,
-            "-oControlPath",
-            control_path,
+            cp_opt,
             "-O",
             "exit",
             self.states[idx].spec.host,
@@ -816,12 +823,11 @@ const Ship = struct {
 
         const stdin = child.stdin.?;
 
-        if (actually_compress) {
-            // Use gzip command instead of library for now
-            try self.streamWithGzip(idx, local_file, stdin);
-        } else {
-            try self.streamWithProgress(idx, local_file, stdin);
-        }
+        const stream_err = if (actually_compress)
+            self.streamWithGzip(idx, local_file, stdin)
+        else
+            self.streamWithProgress(idx, local_file, stdin);
+
         // Close stdin to signal EOF, then null out to prevent double-close in wait()
         stdin.close();
         child.stdin = null;
@@ -833,6 +839,9 @@ const Ship = struct {
         _ = child.collectOutput(self.allocator, &stdout_list, &stderr_list, 64 * 1024) catch {};
 
         const term = try child.wait();
+
+        // Propagate stream error after cleanup
+        stream_err catch |e| return e;
         const failed = switch (term) {
             .Exited => |code| code != 0,
             else => true,
@@ -914,30 +923,39 @@ const Ship = struct {
         const gzip_stdin = gzip_child.stdin.?;
         const gzip_stdout = gzip_child.stdout.?;
 
-        // We need to handle this in a thread or use non-blocking I/O
-        // For simplicity, spawn a thread to read from gzip and write to ssh
+        // Writer thread: reads gzip stdout, writes to ssh stdin
         const WriterContext = struct {
             src: std.fs.File,
             dst: std.fs.File,
             last_progress: *std.time.Instant,
             mutex: *std.Thread.Mutex,
+            write_err: *bool,
         };
 
         var writer_last_progress = std.time.Instant.now() catch @panic("no clock");
+        var writer_had_error: bool = false;
 
         const writer_thread = try std.Thread.spawn(.{}, struct {
             fn run(ctx: WriterContext) void {
                 var buf: [65536]u8 = undefined;
+                var had_write_err = false;
                 while (true) {
                     const n = ctx.src.read(&buf) catch break;
                     if (n == 0) break;
-                    ctx.dst.writeAll(buf[0..n]) catch break;
-                    // update progress time - ssh accepted data
-                    if (std.time.Instant.now()) |now| {
-                        ctx.mutex.lock();
-                        ctx.last_progress.* = now;
-                        ctx.mutex.unlock();
-                    } else |_| {}
+                    // Keep draining gzip stdout even after write error to prevent gzip blocking
+                    if (!had_write_err) {
+                        ctx.dst.writeAll(buf[0..n]) catch {
+                            ctx.write_err.* = true;
+                            had_write_err = true;
+                            continue; // keep reading to drain gzip output
+                        };
+                        // update progress time - ssh accepted data
+                        if (std.time.Instant.now()) |now| {
+                            ctx.mutex.lock();
+                            ctx.last_progress.* = now;
+                            ctx.mutex.unlock();
+                        } else |_| {}
+                    }
                 }
             }
         }.run, .{WriterContext{
@@ -945,6 +963,7 @@ const Ship = struct {
             .dst = out,
             .last_progress = &writer_last_progress,
             .mutex = &self.mutex,
+            .write_err = &writer_had_error,
         }});
 
         // Stream file to gzip stdin with progress
@@ -953,6 +972,9 @@ const Ship = struct {
         var stream_err: ?anyerror = null;
 
         while (true) {
+            // Check if writer failed (ssh died) - stop feeding gzip
+            if (writer_had_error) break;
+
             const n = file.read(&buf) catch |e| {
                 stream_err = e;
                 break;
@@ -978,9 +1000,16 @@ const Ship = struct {
         gzip_child.stdin = null;
 
         writer_thread.join();
+
+        // Close gzip stdout to unblock gzip if it's stuck writing
+        // (happens when ssh dies and writer thread stops draining)
+        gzip_stdout.close();
+        gzip_child.stdout = null;
+
         _ = gzip_child.wait() catch {};
 
         if (stream_err) |e| return e;
+        if (writer_had_error) return error.BrokenPipe;
     }
 
     fn installFile(self: *Ship, idx: u32, spec: HostSpec, tmp_path: []const u8, dest: []const u8) !void {
