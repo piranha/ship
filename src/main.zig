@@ -435,10 +435,14 @@ const Ship = struct {
         const prev = self.states[idx].status;
         self.states[idx].status = status;
         if (status == .failed and prev != .failed) self.failed_count += 1;
-        if (status == .uploading or status == .checking) {
-            const now = std.time.Instant.now() catch return;
-            self.states[idx].start_time = now;
-            self.states[idx].last_progress_time = now;
+        // reset timers on any active state transition
+        switch (status) {
+            .done, .skipped, .failed => {},
+            else => {
+                const now = std.time.Instant.now() catch return;
+                if (status == .uploading or status == .checking) self.states[idx].start_time = now;
+                self.states[idx].last_progress_time = now;
+            },
         }
         self.logFinalLocked(idx, prev);
     }
@@ -605,7 +609,23 @@ const Ship = struct {
             child.stdout_behavior = .Ignore;
             child.stderr_behavior = .Ignore;
 
-            const term = child.spawnAndWait() catch continue;
+            child.spawn() catch continue;
+            {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                self.states[idx].child_pid = child.id;
+            }
+            const term = child.wait() catch {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                self.states[idx].child_pid = null;
+                continue;
+            };
+            {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                self.states[idx].child_pid = null;
+            }
             if (!termSuccess(term)) continue;
 
             // -f forks to background; socket may not exist yet, poll briefly
@@ -1249,77 +1269,47 @@ const Ship = struct {
             for (self.states, 0..) |*state, i| {
                 var status_buf: [16]u8 = undefined;
                 const status_str: []const u8 = switch (state.status) {
-                    .pending => blk: {
-                        all_done = false;
-                        break :blk "...";
-                    },
-                    .checking => blk: {
-                        all_done = false;
-                        // stall detection for probe phase
-                        const since_start = now.since(state.last_progress_time);
-                        if (since_start > stall_ns) {
-                            if (state.error_msg == null) {
-                                state.error_msg = self.allocator.dupe(u8, "stalled") catch null;
-                            }
-                            if (state.child_pid) |pid| {
-                                std.posix.kill(pid, std.posix.SIG.KILL) catch {};
-                            }
-                            self.setStatusLocked(@intCast(i), .failed);
-                            if (stalled_count < stalled_buf.len) {
-                                stalled_buf[stalled_count] = @intCast(i);
-                                stalled_count += 1;
-                            }
-                            break :blk "STALL";
-                        }
-                        break :blk "...";
-                    },
-                    .uploading => blk: {
-                        all_done = false;
-                        // Check for stall
-                        const since_progress = now.since(state.last_progress_time);
-                        if (since_progress > stall_ns) {
-                            // inline setErrorMsg to avoid deadlock (mutex already held)
-                            if (state.error_msg == null) {
-                                state.error_msg = self.allocator.dupe(u8, "stalled") catch null;
-                            }
-                            if (state.child_pid) |pid| {
-                                std.posix.kill(pid, std.posix.SIG.KILL) catch {};
-                            }
-                            if (state.gzip_pid) |pid| {
-                                std.posix.kill(pid, std.posix.SIG.KILL) catch {};
-                            }
-                            self.setStatusLocked(@intCast(i), .failed);
-                            if (stalled_count < stalled_buf.len) {
-                                stalled_buf[stalled_count] = @intCast(i);
-                                stalled_count += 1;
-                            }
-                            break :blk "STALL";
-                        }
-                        // Calculate speed
-                        const elapsed_ns = now.since(state.start_time);
-                        if (elapsed_ns > 0 and state.bytes_sent > 0) {
-                            const speed = @divTrunc(state.bytes_sent * 1_000_000_000, elapsed_ns);
-                            const speed_kb = @divTrunc(speed, 1024);
-                            if (speed_kb >= 1024) {
-                                const speed_mb = @divTrunc(speed_kb, 1024);
-                                break :blk std.fmt.bufPrint(&status_buf, "{d}% {d}M", .{ state.progress, speed_mb }) catch "?";
-                            } else {
-                                break :blk std.fmt.bufPrint(&status_buf, "{d}% {d}K", .{ state.progress, speed_kb }) catch "?";
-                            }
-                        }
-                        break :blk std.fmt.bufPrint(&status_buf, "{d}%", .{state.progress}) catch "?";
-                    },
-                    .installing => blk: {
-                        all_done = false;
-                        break :blk "INS";
-                    },
-                    .restarting => blk: {
-                        all_done = false;
-                        break :blk "RST";
-                    },
                     .done => "OK",
                     .skipped => "SKIP",
                     .failed => "ERR",
+                    else => blk: {
+                        all_done = false;
+                        // stall detection for all active states
+                        const since_progress = now.since(state.last_progress_time);
+                        if (since_progress > stall_ns) {
+                            if (state.error_msg == null) {
+                                state.error_msg = self.allocator.dupe(u8, "stalled") catch null;
+                            }
+                            if (state.child_pid) |pid| std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+                            if (state.gzip_pid) |pid| std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+                            self.setStatusLocked(@intCast(i), .failed);
+                            if (stalled_count < stalled_buf.len) {
+                                stalled_buf[stalled_count] = @intCast(i);
+                                stalled_count += 1;
+                            }
+                            break :blk "STALL";
+                        }
+                        break :blk switch (state.status) {
+                            .pending => "...",
+                            .checking => "...",
+                            .uploading => speed: {
+                                const elapsed_ns = now.since(state.start_time);
+                                if (elapsed_ns > 0 and state.bytes_sent > 0) {
+                                    const speed = @divTrunc(state.bytes_sent * 1_000_000_000, elapsed_ns);
+                                    const speed_kb = @divTrunc(speed, 1024);
+                                    if (speed_kb >= 1024) {
+                                        break :speed std.fmt.bufPrint(&status_buf, "{d}% {d}M", .{ state.progress, @divTrunc(speed_kb, 1024) }) catch "?";
+                                    } else {
+                                        break :speed std.fmt.bufPrint(&status_buf, "{d}% {d}K", .{ state.progress, speed_kb }) catch "?";
+                                    }
+                                }
+                                break :speed std.fmt.bufPrint(&status_buf, "{d}%", .{state.progress}) catch "?";
+                            },
+                            .installing => "INS",
+                            .restarting => "RST",
+                            else => "?",
+                        };
+                    },
                 };
 
                 // Track hidden hosts for summary
@@ -1383,7 +1373,7 @@ const Ship = struct {
             for (self.states, 0..) |*state, i| {
                 switch (state.status) {
                     .done, .skipped, .failed => {},
-                    .uploading, .checking => {
+                    else => {
                         all_done = false;
                         const since_progress = now.since(state.last_progress_time);
                         if (since_progress > stall_ns) {
@@ -1399,11 +1389,9 @@ const Ship = struct {
                             }
                         }
                     },
-                    else => { all_done = false; },
                 }
             }
             self.mutex.unlock();
-            // Close control masters outside mutex to tear down multiplexed channels
             for (stalled_buf[0..stalled_count]) |idx| {
                 self.closeControlMaster(idx);
             }
