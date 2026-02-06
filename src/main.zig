@@ -274,6 +274,65 @@ const Ship = struct {
     failed_count: u32,
     use_compression: bool,
     output_tty: bool,
+    dump_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    var sig_ship: ?*Ship = null;
+
+    fn installSigUsr1(self: *Ship) void {
+        sig_ship = self;
+        const act = std.posix.Sigaction{
+            .handler = .{ .handler = handleSigUsr1 },
+            .mask = std.posix.sigemptyset(),
+            .flags = std.os.linux.SA.RESTART,
+        };
+        std.posix.sigaction(std.posix.SIG.USR1, &act, null);
+    }
+
+    fn handleSigUsr1(_: c_int) callconv(.c) void {
+        if (sig_ship) |s| s.dump_requested.store(true, .release);
+    }
+
+    fn dumpState(self: *Ship) void {
+        const stderr = std.fs.File.stderr();
+        var buf: [4096]u8 = undefined;
+        var pos: usize = 0;
+
+        const now = std.time.Instant.now() catch return;
+
+        pos += (std.fmt.bufPrint(buf[pos..], "\n=== ship state dump ===\n", .{}) catch return).len;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.states, 0..) |*state, i| {
+            const label = self.getHostLabel(state.spec);
+            const status_name: []const u8 = switch (state.status) {
+                .pending => "PENDING",
+                .checking => "CHECKING",
+                .uploading => "UPLOADING",
+                .installing => "INSTALLING",
+                .restarting => "RESTARTING",
+                .done => "DONE",
+                .skipped => "SKIP",
+                .failed => "FAILED",
+            };
+            const stall_s = now.since(state.last_progress_time) / 1_000_000_000;
+            const line = std.fmt.bufPrint(buf[pos..], "[{d}] {s}: {s} progress={d}% stall={d}s pid={?} gzip={?} cp={s} err={s}\n", .{
+                i,
+                label,
+                status_name,
+                state.progress,
+                stall_s,
+                state.child_pid,
+                state.gzip_pid,
+                if (state.control_path) |cp| cp else "(none)",
+                if (state.error_msg) |msg| msg else "(none)",
+            }) catch break;
+            pos += line.len;
+        }
+        pos += (std.fmt.bufPrint(buf[pos..], "=== end dump ===\n", .{}) catch return).len;
+        stderr.writeAll(buf[0..pos]) catch {};
+    }
 
     fn init(allocator: std.mem.Allocator, config: Config) !*Ship {
         const ship = try allocator.create(Ship);
@@ -337,6 +396,7 @@ const Ship = struct {
         };
 
         self.output_tty = std.fs.File.stdout().isTty();
+        self.installSigUsr1();
 
         // spawn workers
         var threads = try self.allocator.alloc(std.Thread, self.config.opts.jobs);
@@ -1251,6 +1311,8 @@ const Ship = struct {
         while (!all_done) {
             std.Thread.sleep(100_000_000); // 100ms
 
+            if (self.dump_requested.swap(false, .acquire)) self.dumpState();
+
             const now = std.time.Instant.now() catch continue;
 
             var pos: usize = 0;
@@ -1366,6 +1428,7 @@ const Ship = struct {
         var stalled_buf: [256]u32 = undefined;
         while (true) {
             std.Thread.sleep(500_000_000); // 500ms
+            if (self.dump_requested.swap(false, .acquire)) self.dumpState();
             const now = std.time.Instant.now() catch continue;
             var all_done = true;
             var stalled_count: usize = 0;

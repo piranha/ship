@@ -39,3 +39,7 @@ Incomplete list - add entries when agent slip-ups occur.
 - `std.io.fixedBufferStream(&buf)` lowercase
 - `@intFromPtr`/`@ptrFromInt` not old `@ptrToInt`/`@intToPtr`
 - Use `writer: anytype` in function signatures
+- `callconv(.c)` not `callconv(.C)` (lowercase)
+- `std.posix.sigemptyset()` not `std.posix.empty_sigset`
+- `std.posix.sigaction()` returns `void` not error union
+- Sigaction `.flags` is raw `c_ulong`, use `std.os.linux.SA.RESTART` etc
