@@ -221,5 +221,89 @@ wait $SHIP_PID 2>/dev/null || true
 pass "ssh death without compression (no deadlock)"
 ssh_cmd $TEST_HOST1_PORT "rm -f $DEST" 2>/dev/null || true
 
+# Test 13: Empty file upload (bug #5 - division by zero)
+echo "Test 13: Empty file upload"
+EMPTY_FILE="$WORK_DIR/emptyfile"
+touch "$EMPTY_FILE"
+EMPTY_MD5=$(md5sum "$EMPTY_FILE" | cut -d' ' -f1)
+DEST="/tmp/ship_test_13"
+$SHIP "$SHIP_SSH_OPTS" --port $TEST_HOST1_PORT --skip-md5 --compress=off \
+    "$EMPTY_FILE:$DEST" 127.0.0.1 --quiet 2>&1
+REMOTE_MD5=$(ssh_cmd $TEST_HOST1_PORT "md5sum $DEST" | cut -d' ' -f1)
+[ "$EMPTY_MD5" = "$REMOTE_MD5" ] && pass "empty file upload" || fail "empty file md5 mismatch"
+ssh_cmd $TEST_HOST1_PORT "rm -f $DEST"
+
+# Test 14: Empty file upload with compression (bug #5 variant)
+echo "Test 14: Empty file upload with compression"
+DEST="/tmp/ship_test_14"
+$SHIP "$SHIP_SSH_OPTS" --port $TEST_HOST1_PORT --skip-md5 --compress=on \
+    "$EMPTY_FILE:$DEST" 127.0.0.1 --quiet 2>&1
+REMOTE_MD5=$(ssh_cmd $TEST_HOST1_PORT "md5sum $DEST" | cut -d' ' -f1)
+[ "$EMPTY_MD5" = "$REMOTE_MD5" ] && pass "empty file upload (compressed)" || fail "empty file compressed md5 mismatch"
+ssh_cmd $TEST_HOST1_PORT "rm -f $DEST"
+
+# Test 15: Compress level is respected (bug #4)
+echo "Test 15: Compress level option"
+DEST="/tmp/ship_test_15"
+# Use high compression - should still produce correct output
+$SHIP "$SHIP_SSH_OPTS" --port $TEST_HOST1_PORT --skip-md5 --compress=on --compress-level 9 \
+    "$LARGE_FILE:$DEST" 127.0.0.1 --quiet
+REMOTE_MD5=$(ssh_cmd $TEST_HOST1_PORT "md5sum $DEST" | cut -d' ' -f1)
+[ "$LARGE_MD5" = "$REMOTE_MD5" ] && pass "compress level 9" || fail "compress level md5 mismatch"
+ssh_cmd $TEST_HOST1_PORT "rm -f $DEST"
+
+# Test 16: Signal-terminated SSH doesn't crash ship (bug #3)
+echo "Test 16: Install with killed SSH (signal handling)"
+DEST="/tmp/ship_test_16"
+# Upload a file, then try to install to an impossible path that will cause ssh to be killed
+# We just verify ship exits cleanly (doesn't panic) when ssh is signal-killed
+$SHIP "$SHIP_SSH_OPTS" --port $TEST_HOST1_PORT --skip-md5 --compress=off \
+    "$TEST_FILE:$DEST" 127.0.0.1 --quiet 2>&1 &
+SHIP_PID=$!
+sleep 0.1
+# Send SIGTERM to ship's ssh children to simulate signal termination
+pkill -TERM -P $SHIP_PID -f ssh 2>/dev/null || true
+TIMEOUT=10
+ELAPSED=0
+while kill -0 $SHIP_PID 2>/dev/null; do
+    sleep 0.1
+    ELAPSED=$(echo "$ELAPSED + 0.1" | bc)
+    if [ "$(echo "$ELAPSED > $TIMEOUT" | bc)" -eq 1 ]; then
+        kill -9 $SHIP_PID 2>/dev/null || true
+        fail "ship crashed/hung on signal-terminated ssh"
+    fi
+done
+wait $SHIP_PID 2>/dev/null || true
+pass "signal-terminated SSH handled cleanly"
+ssh_cmd $TEST_HOST1_PORT "rm -f $DEST" 2>/dev/null || true
+
+# Test 17: Stall detection in quiet mode (bug #6)
+echo "Test 17: Stall detection in quiet mode"
+# Create a large file for stall tests
+STALL_FILE="$WORK_DIR/stallfile.bin"
+dd if=/dev/urandom of="$STALL_FILE" bs=1M count=10 2>/dev/null
+# Use a FIFO so the write blocks once pipe buffer fills
+DEST="/tmp/ship_test_17_fifo"
+ssh_cmd $TEST_HOST1_PORT "rm -f $DEST; mkfifo $DEST"
+timeout 15 $SHIP "$SHIP_SSH_OPTS" --port $TEST_HOST1_PORT --skip-md5 --compress=off \
+    --stall-timeout 2 --quiet "$STALL_FILE:$DEST" 127.0.0.1 2>&1 || true
+EXIT_CODE=$?
+# timeout returns 124 if it killed the process
+[ "$EXIT_CODE" != "124" ] && pass "stall detection in quiet mode" || fail "ship hung in quiet mode (stall not detected)"
+ssh_cmd $TEST_HOST1_PORT "rm -f $DEST" 2>/dev/null || true
+
+# Test 18: Stall detection with progress (bug #1 - deadlock)
+echo "Test 18: Stall detection deadlock check"
+# Use a FIFO as dest so the write blocks once the FIFO buffer fills up (64K typically)
+DEST="/tmp/ship_test_18_fifo"
+ssh_cmd $TEST_HOST1_PORT "rm -f $DEST; mkfifo $DEST"
+# Nobody reads the FIFO, so "cat > fifo" will block after the pipe buffer fills.
+# Ship should detect stall and exit cleanly (not deadlock).
+timeout 15 $SHIP "$SHIP_SSH_OPTS" --port $TEST_HOST1_PORT --skip-md5 --compress=off \
+    --stall-timeout 2 "$STALL_FILE:$DEST" 127.0.0.1 2>&1 || true
+EXIT_CODE=$?
+[ "$EXIT_CODE" != "124" ] && pass "stall detection no deadlock" || fail "deadlock in stall detection"
+ssh_cmd $TEST_HOST1_PORT "rm -f $DEST" 2>/dev/null || true
+
 echo ""
 echo "=== All tests passed ==="

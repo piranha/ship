@@ -4,6 +4,18 @@ const opt = @import("opt");
 
 const CompressMode = enum { auto, on, off };
 
+fn termSuccess(term: std.process.Child.Term) bool {
+    return switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+}
+
+fn calcProgress(total_read: u64, total_size: u64) u8 {
+    if (total_size == 0) return 100;
+    return @intCast(@min(100, (total_read * 100) / total_size));
+}
+
 fn friendlyError(err: anyerror) []const u8 {
     return switch (err) {
         error.ProbeFailed => "SSH probe failed (connection or auth error)",
@@ -334,9 +346,11 @@ const Ship = struct {
             threads[i] = try std.Thread.spawn(.{}, workerThread, .{ self, &next_host });
         }
 
-        // progress display loop
+        // progress display / stall monitor loop
         if (!self.config.opts.quiet) {
             try self.progressLoop(threads);
+        } else {
+            self.stallMonitorLoop();
         }
 
         for (threads) |t| t.join();
@@ -540,7 +554,7 @@ const Ship = struct {
 
     fn startControlMaster(self: *Ship, idx: u32, spec: HostSpec) !void {
         const pid = std.os.linux.getpid();
-        const control_path = try std.fmt.allocPrint(self.allocator, "/tmp/.ship-{d}-{s}.sock", .{ pid, spec.host });
+        const control_path = try std.fmt.allocPrint(self.allocator, "/tmp/.ship-{d}-{d}-{s}.sock", .{ pid, idx, spec.host });
         errdefer self.allocator.free(control_path);
 
         // Build args for master connection
@@ -565,11 +579,12 @@ const Ship = struct {
         try args.append(self.allocator, "-f"); // fork to background after auth
         try args.append(self.allocator, "-N"); // no remote command
 
+        var port_str_alloc: ?[]const u8 = null;
+        defer if (port_str_alloc) |p| self.allocator.free(p);
         if (self.config.opts.port) |port| {
             try args.append(self.allocator, "-p");
-            var port_buf: [8]u8 = undefined;
-            const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
-            try args.append(self.allocator, port_str);
+            port_str_alloc = try std.fmt.allocPrint(self.allocator, "{d}", .{port});
+            try args.append(self.allocator, port_str_alloc.?);
         }
 
         const user = spec.user orelse self.config.opts.user;
@@ -591,7 +606,7 @@ const Ship = struct {
             child.stderr_behavior = .Ignore;
 
             const term = child.spawnAndWait() catch continue;
-            if (term.Exited != 0) continue;
+            if (!termSuccess(term)) continue;
 
             // -f forks to background; socket may not exist yet, poll briefly
             var sock_ok = false;
@@ -763,6 +778,7 @@ const Ship = struct {
 
         // pick best location: dest dir > home > /tmp
         const tmp_dir: []const u8 = blk: {
+            // prefer same-fs locations (atomic mv)
             if (fs_info.dest_writable and fs_info.dest_free >= size_needed) {
                 break :blk dest_dir;
             }
@@ -772,15 +788,7 @@ const Ship = struct {
             if (fs_info.tmp_dev == fs_info.dest_dev and fs_info.tmp_free >= size_needed) {
                 break :blk "/tmp";
             }
-            // fallback: prefer same-fs even without dest write permission (sudo will handle)
-            if (fs_info.home_dev == fs_info.dest_dev and fs_info.home_free >= size_needed) {
-                break :blk "~";
-            }
-            if (fs_info.tmp_dev == fs_info.dest_dev and fs_info.tmp_free >= size_needed) {
-                break :blk "/tmp";
-            }
-            // last resort: any location with space (mv will copy across fs)
-            if (fs_info.dest_writable and fs_info.dest_free >= size_needed) break :blk dest_dir;
+            // cross-fs fallback (mv will copy)
             if (fs_info.home_free >= size_needed) break :blk "~";
             if (fs_info.tmp_free >= size_needed) break :blk "/tmp";
             return error.NoSpaceOnRemote;
@@ -905,14 +913,25 @@ const Ship = struct {
             try out.writeAll(buf[0..n]);
             total_read += n;
 
-            const progress: u8 = @intCast(@min(100, (total_read * 100) / self.local_size));
-            self.setProgress(idx, progress, total_read);
+            self.setProgress(idx, calcProgress(total_read, self.local_size), total_read);
         }
     }
 
     fn streamWithGzip(self: *Ship, idx: u32, file: std.fs.File, out: std.fs.File) !void {
         // Use gzip command as subprocess
-        var gzip_child = std.process.Child.init(&.{ "gzip", "-c", "-1" }, self.allocator);
+        const level_flag: []const u8 = switch (self.config.opts.compress_level) {
+            1 => "-1",
+            2 => "-2",
+            3 => "-3",
+            4 => "-4",
+            5 => "-5",
+            6 => "-6",
+            7 => "-7",
+            8 => "-8",
+            9 => "-9",
+            else => "-1",
+        };
+        var gzip_child = std.process.Child.init(&.{ "gzip", "-c", level_flag }, self.allocator);
         gzip_child.stdin_behavior = .Pipe;
         gzip_child.stdout_behavior = .Pipe;
         gzip_child.stderr_behavior = .Pipe;
@@ -996,11 +1015,10 @@ const Ship = struct {
             };
             total_read += n;
 
-            const progress: u8 = @intCast(@min(100, (total_read * 100) / self.local_size));
             // use writer's progress time (tracks ssh, not gzip input)
             {
                 self.mutex.lock();
-                self.states[idx].progress = progress;
+                self.states[idx].progress = calcProgress(total_read, self.local_size);
                 self.states[idx].bytes_sent = total_read;
                 self.states[idx].last_progress_time = writer_last_progress;
                 self.mutex.unlock();
@@ -1063,7 +1081,7 @@ const Ship = struct {
         const result = try self.runSshCommand(idx, spec, cmd_buf[0..pos]);
         defer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);
-        if (result.term.Exited != 0) {
+        if (!termSuccess(result.term)) {
             // store and print error immediately
             if (result.stderr.len > 0) {
                 const first_line = if (std.mem.indexOf(u8, result.stderr, "\n")) |nl|
@@ -1071,7 +1089,6 @@ const Ship = struct {
                 else
                     result.stderr;
                 if (first_line.len > 0) {
-                    std.debug.print("\n{s}: {s}\n", .{ spec.host, first_line });
                     _ = self.setErrorMsg(idx, first_line);
                 }
             }
@@ -1106,7 +1123,7 @@ const Ship = struct {
         const result = try self.runSshCommand(idx, spec, remote_cmd);
         defer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);
-        if (result.term.Exited != 0) {
+        if (!termSuccess(result.term)) {
             return error.RestartFailed;
         }
     }
@@ -1198,14 +1215,16 @@ const Ship = struct {
                         // Check for stall
                         const since_progress = now.since(state.last_progress_time);
                         if (since_progress > stall_ns) {
-                            _ = self.setErrorMsg(@intCast(i), "stalled");
+                            // inline setErrorMsg to avoid deadlock (mutex already held)
+                            if (state.error_msg == null) {
+                                state.error_msg = self.allocator.dupe(u8, "stalled") catch null;
+                            }
                             if (state.child_pid) |pid| {
                                 std.posix.kill(pid, std.posix.SIG.KILL) catch {};
                             }
                             if (state.gzip_pid) |pid| {
                                 std.posix.kill(pid, std.posix.SIG.KILL) catch {};
                             }
-                            if (i > std.math.maxInt(u32)) @panic("host index overflow");
                             self.setStatusLocked(@intCast(i), .failed);
                             break :blk "STALL";
                         }
@@ -1247,12 +1266,18 @@ const Ship = struct {
                     continue;
                 }
 
-                @memcpy(print_buf[pos..][0..status_str.len], status_str);
-                pos += status_str.len;
+                const truncated = status_str[0..@min(status_str.len, col_width -| 1)];
+                @memcpy(print_buf[pos..][0..truncated.len], truncated);
+                pos += truncated.len;
                 // Pad to column width
-                const pad = col_width - status_str.len;
-                @memset(print_buf[pos..][0..pad], ' ');
-                pos += pad;
+                if (col_width > truncated.len) {
+                    const pad = col_width - truncated.len;
+                    @memset(print_buf[pos..][0..pad], ' ');
+                    pos += pad;
+                } else {
+                    print_buf[pos] = ' ';
+                    pos += 1;
+                }
             }
             self.mutex.unlock();
 
@@ -1271,6 +1296,36 @@ const Ship = struct {
                 pos += 3;
                 stdout.writeAll(print_buf[0..pos]) catch {};
             }
+        }
+    }
+
+    fn stallMonitorLoop(self: *Ship) void {
+        const stall_ns: u64 = @as(u64, self.config.opts.stall_timeout) * 1_000_000_000;
+        while (true) {
+            std.Thread.sleep(500_000_000); // 500ms
+            const now = std.time.Instant.now() catch continue;
+            var all_done = true;
+            self.mutex.lock();
+            for (self.states, 0..) |*state, i| {
+                switch (state.status) {
+                    .done, .skipped, .failed => {},
+                    .uploading => {
+                        all_done = false;
+                        const since_progress = now.since(state.last_progress_time);
+                        if (since_progress > stall_ns) {
+                            if (state.error_msg == null) {
+                                state.error_msg = self.allocator.dupe(u8, "stalled") catch null;
+                            }
+                            if (state.child_pid) |pid| std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+                            if (state.gzip_pid) |pid| std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+                            self.setStatusLocked(@intCast(i), .failed);
+                        }
+                    },
+                    else => { all_done = false; },
+                }
+            }
+            self.mutex.unlock();
+            if (all_done) return;
         }
     }
 
@@ -1340,6 +1395,30 @@ test "parseHostSpec" {
             try std.testing.expect(result.dest == null);
         }
     }
+}
+
+test "termSuccess" {
+    // Normal exit 0 = success
+    try std.testing.expect(termSuccess(.{ .Exited = 0 }));
+    // Non-zero exit = failure
+    try std.testing.expect(!termSuccess(.{ .Exited = 1 }));
+    try std.testing.expect(!termSuccess(.{ .Exited = 127 }));
+    // Signal = failure (must not panic)
+    try std.testing.expect(!termSuccess(.{ .Signal = 9 }));
+    try std.testing.expect(!termSuccess(.{ .Signal = 15 }));
+    // Stopped = failure
+    try std.testing.expect(!termSuccess(.{ .Stopped = 19 }));
+}
+
+test "calcProgress" {
+    // Normal cases
+    try std.testing.expectEqual(@as(u8, 0), calcProgress(0, 1000));
+    try std.testing.expectEqual(@as(u8, 50), calcProgress(500, 1000));
+    try std.testing.expectEqual(@as(u8, 100), calcProgress(1000, 1000));
+    // Empty file (division by zero guard)
+    try std.testing.expectEqual(@as(u8, 100), calcProgress(0, 0));
+    // Overshoot clamped
+    try std.testing.expectEqual(@as(u8, 100), calcProgress(2000, 1000));
 }
 
 test "escapeShellArg" {
