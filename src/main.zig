@@ -555,13 +555,15 @@ const Ship = struct {
             if (o.len > 0) try args.append(self.allocator, o);
         }
 
-        // ControlMaster options - use ControlPersist=10s so master auto-exits
-        // shortly after ship completes (or gets killed)
+        // ControlMaster options - use -f to background after auth, -N for no command
+        // ControlPersist=10 so master auto-exits shortly after ship completes
         try args.append(self.allocator, "-oControlMaster=yes");
         const cp_opt = try std.fmt.allocPrint(self.allocator, "-oControlPath={s}", .{control_path});
         defer self.allocator.free(cp_opt);
         try args.append(self.allocator, cp_opt);
         try args.append(self.allocator, "-oControlPersist=10");
+        try args.append(self.allocator, "-f"); // fork to background after auth
+        try args.append(self.allocator, "-N"); // no remote command
 
         if (self.config.opts.port) |port| {
             try args.append(self.allocator, "-p");
@@ -577,7 +579,6 @@ const Ship = struct {
         }
 
         try args.append(self.allocator, spec.host);
-        try args.append(self.allocator, "true"); // quick command to establish master
 
         // Retry a few times - transient connection resets are common with parallel connects
         var attempt: u32 = 0;
@@ -592,8 +593,17 @@ const Ship = struct {
             const term = child.spawnAndWait() catch continue;
             if (term.Exited != 0) continue;
 
-            // Verify socket exists
-            std.fs.accessAbsolute(control_path, .{}) catch continue;
+            // -f forks to background; socket may not exist yet, poll briefly
+            var sock_ok = false;
+            for (0..20) |_| {
+                std.fs.accessAbsolute(control_path, .{}) catch {
+                    std.Thread.sleep(50_000_000); // 50ms
+                    continue;
+                };
+                sock_ok = true;
+                break;
+            }
+            if (!sock_ok) continue;
             self.states[idx].control_path = control_path;
             return;
         }
