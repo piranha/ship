@@ -435,7 +435,7 @@ const Ship = struct {
         const prev = self.states[idx].status;
         self.states[idx].status = status;
         if (status == .failed and prev != .failed) self.failed_count += 1;
-        if (status == .uploading) {
+        if (status == .uploading or status == .checking) {
             const now = std.time.Instant.now() catch return;
             self.states[idx].start_time = now;
             self.states[idx].last_progress_time = now;
@@ -681,22 +681,39 @@ const Ship = struct {
         const space = if (self.config.opts.sudo) " " else "";
 
         // single ssh call: md5 + fs probe + gunzip check
+        // skip md5sum when --skip-md5 (avoids blocking on FIFOs/special files)
         var cmd_buf: [2048]u8 = undefined;
-        const cmd = std.fmt.bufPrint(&cmd_buf,
-            \\m=$({s}{s}md5sum {s} 2>/dev/null || {s}{s}busybox md5sum {s} 2>/dev/null)
-            \\d={s}
-            \\dd=$(stat -c %d "$d" 2>/dev/null)
-            \\df=$(($(df -k "$d" 2>/dev/null | awk 'NR==2{{print $4}}')*1024))
-            \\dw=$(test -w "$d" && echo 1 || echo 0)
-            \\hd=$(stat -c %d ~ 2>/dev/null)
-            \\hf=$(($(df -k ~ 2>/dev/null | awk 'NR==2{{print $4}}')*1024))
-            \\td=$(stat -c %d /tmp 2>/dev/null)
-            \\tf=$(($(df -k /tmp 2>/dev/null | awk 'NR==2{{print $4}}')*1024))
-            \\gz=$(command -v gunzip >/dev/null 2>&1 || command -v busybox >/dev/null 2>&1 && echo 1 || echo 0)
-            \\echo "$m"
-            \\echo "$dd $df $dw $hd $hf $td $tf $gz"
-        , .{ sudo_prefix, space, escaped_dest, sudo_prefix, space, escaped_dest, escaped_dest_dir }) catch
-            return error.CommandTooLong;
+        const cmd = if (self.config.opts.skip_md5)
+            std.fmt.bufPrint(&cmd_buf,
+                \\d={s}
+                \\dd=$(stat -c %d "$d" 2>/dev/null)
+                \\df=$(($(df -k "$d" 2>/dev/null | awk 'NR==2{{print $4}}')*1024))
+                \\dw=$(test -w "$d" && echo 1 || echo 0)
+                \\hd=$(stat -c %d ~ 2>/dev/null)
+                \\hf=$(($(df -k ~ 2>/dev/null | awk 'NR==2{{print $4}}')*1024))
+                \\td=$(stat -c %d /tmp 2>/dev/null)
+                \\tf=$(($(df -k /tmp 2>/dev/null | awk 'NR==2{{print $4}}')*1024))
+                \\gz=$(command -v gunzip >/dev/null 2>&1 || command -v busybox >/dev/null 2>&1 && echo 1 || echo 0)
+                \\echo ""
+                \\echo "$dd $df $dw $hd $hf $td $tf $gz"
+            , .{escaped_dest_dir}) catch
+                return error.CommandTooLong
+        else
+            std.fmt.bufPrint(&cmd_buf,
+                \\m=$({s}{s}md5sum {s} 2>/dev/null || {s}{s}busybox md5sum {s} 2>/dev/null)
+                \\d={s}
+                \\dd=$(stat -c %d "$d" 2>/dev/null)
+                \\df=$(($(df -k "$d" 2>/dev/null | awk 'NR==2{{print $4}}')*1024))
+                \\dw=$(test -w "$d" && echo 1 || echo 0)
+                \\hd=$(stat -c %d ~ 2>/dev/null)
+                \\hf=$(($(df -k ~ 2>/dev/null | awk 'NR==2{{print $4}}')*1024))
+                \\td=$(stat -c %d /tmp 2>/dev/null)
+                \\tf=$(($(df -k /tmp 2>/dev/null | awk 'NR==2{{print $4}}')*1024))
+                \\gz=$(command -v gunzip >/dev/null 2>&1 || command -v busybox >/dev/null 2>&1 && echo 1 || echo 0)
+                \\echo "$m"
+                \\echo "$dd $df $dw $hd $hf $td $tf $gz"
+            , .{ sudo_prefix, space, escaped_dest, sudo_prefix, space, escaped_dest, escaped_dest_dir }) catch
+                return error.CommandTooLong;
 
         const result = try self.runSshCommand(idx, spec, cmd);
         defer self.allocator.free(result.stdout);
@@ -752,11 +769,35 @@ const Ship = struct {
         defer ssh_args.deinit();
         try ssh_args.args.append(self.allocator, remote_cmd);
 
-        const result = try std.process.Child.run(.{
-            .allocator = self.allocator,
-            .argv = ssh_args.args.items,
-        });
-        return result;
+        var child = std.process.Child.init(ssh_args.args.items, self.allocator);
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
+        try child.spawn();
+
+        // store pid so stall monitor can kill stuck probes
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.states[idx].child_pid = child.id;
+        }
+        defer {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.states[idx].child_pid = null;
+        }
+
+        var stdout_list: std.ArrayList(u8) = .{};
+        defer stdout_list.deinit(self.allocator);
+        var stderr_list: std.ArrayList(u8) = .{};
+        defer stderr_list.deinit(self.allocator);
+        _ = child.collectOutput(self.allocator, &stdout_list, &stderr_list, 64 * 1024) catch {};
+
+        const term = try child.wait();
+        return .{
+            .stdout = try stdout_list.toOwnedSlice(self.allocator),
+            .stderr = try stderr_list.toOwnedSlice(self.allocator),
+            .term = term,
+        };
     }
 
     fn getTmpPath(self: *Ship, fs_info: FsInfo, dest: []const u8) ![]const u8 {
@@ -1186,6 +1227,7 @@ const Ship = struct {
 
         const stall_ns: u64 = @as(u64, self.config.opts.stall_timeout) * 1_000_000_000;
 
+        var stalled_buf: [256]u32 = undefined;
         while (!all_done) {
             std.Thread.sleep(100_000_000); // 100ms
 
@@ -1195,6 +1237,7 @@ const Ship = struct {
             print_buf[pos] = '\r';
             pos += 1;
             all_done = true;
+            var stalled_count: usize = 0;
 
             // Summary counters for hidden hosts
             var summary_done: usize = 0;
@@ -1206,8 +1249,28 @@ const Ship = struct {
             for (self.states, 0..) |*state, i| {
                 var status_buf: [16]u8 = undefined;
                 const status_str: []const u8 = switch (state.status) {
-                    .pending, .checking => blk: {
+                    .pending => blk: {
                         all_done = false;
+                        break :blk "...";
+                    },
+                    .checking => blk: {
+                        all_done = false;
+                        // stall detection for probe phase
+                        const since_start = now.since(state.last_progress_time);
+                        if (since_start > stall_ns) {
+                            if (state.error_msg == null) {
+                                state.error_msg = self.allocator.dupe(u8, "stalled") catch null;
+                            }
+                            if (state.child_pid) |pid| {
+                                std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+                            }
+                            self.setStatusLocked(@intCast(i), .failed);
+                            if (stalled_count < stalled_buf.len) {
+                                stalled_buf[stalled_count] = @intCast(i);
+                                stalled_count += 1;
+                            }
+                            break :blk "STALL";
+                        }
                         break :blk "...";
                     },
                     .uploading => blk: {
@@ -1226,6 +1289,10 @@ const Ship = struct {
                                 std.posix.kill(pid, std.posix.SIG.KILL) catch {};
                             }
                             self.setStatusLocked(@intCast(i), .failed);
+                            if (stalled_count < stalled_buf.len) {
+                                stalled_buf[stalled_count] = @intCast(i);
+                                stalled_count += 1;
+                            }
                             break :blk "STALL";
                         }
                         // Calculate speed
@@ -1281,6 +1348,11 @@ const Ship = struct {
             }
             self.mutex.unlock();
 
+            // Close control masters outside mutex to tear down multiplexed channels
+            for (stalled_buf[0..stalled_count]) |stalled_idx| {
+                self.closeControlMaster(stalled_idx);
+            }
+
             // Show summary for hidden hosts
             if (show_summary) {
                 const written = std.fmt.bufPrint(print_buf[pos..], "+{d}\u{2713} {d}\u{2717} {d}\u{21bb}", .{
@@ -1301,15 +1373,17 @@ const Ship = struct {
 
     fn stallMonitorLoop(self: *Ship) void {
         const stall_ns: u64 = @as(u64, self.config.opts.stall_timeout) * 1_000_000_000;
+        var stalled_buf: [256]u32 = undefined;
         while (true) {
             std.Thread.sleep(500_000_000); // 500ms
             const now = std.time.Instant.now() catch continue;
             var all_done = true;
+            var stalled_count: usize = 0;
             self.mutex.lock();
             for (self.states, 0..) |*state, i| {
                 switch (state.status) {
                     .done, .skipped, .failed => {},
-                    .uploading => {
+                    .uploading, .checking => {
                         all_done = false;
                         const since_progress = now.since(state.last_progress_time);
                         if (since_progress > stall_ns) {
@@ -1319,12 +1393,20 @@ const Ship = struct {
                             if (state.child_pid) |pid| std.posix.kill(pid, std.posix.SIG.KILL) catch {};
                             if (state.gzip_pid) |pid| std.posix.kill(pid, std.posix.SIG.KILL) catch {};
                             self.setStatusLocked(@intCast(i), .failed);
+                            if (stalled_count < stalled_buf.len) {
+                                stalled_buf[stalled_count] = @intCast(i);
+                                stalled_count += 1;
+                            }
                         }
                     },
                     else => { all_done = false; },
                 }
             }
             self.mutex.unlock();
+            // Close control masters outside mutex to tear down multiplexed channels
+            for (stalled_buf[0..stalled_count]) |idx| {
+                self.closeControlMaster(idx);
+            }
             if (all_done) return;
         }
     }

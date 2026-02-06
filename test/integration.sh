@@ -279,30 +279,31 @@ ssh_cmd $TEST_HOST1_PORT "rm -f $DEST" 2>/dev/null || true
 
 # Test 17: Stall detection in quiet mode (bug #6)
 echo "Test 17: Stall detection in quiet mode"
-# Create a large file for stall tests
 STALL_FILE="$WORK_DIR/stallfile.bin"
 dd if=/dev/urandom of="$STALL_FILE" bs=1M count=10 2>/dev/null
-# Use a FIFO so the write blocks once pipe buffer fills
+# Use a FIFO as --tmp so the remote cat blocks on open, triggering stall detection
 DEST="/tmp/ship_test_17_fifo"
 ssh_cmd $TEST_HOST1_PORT "rm -f $DEST; mkfifo $DEST"
-timeout 15 $SHIP "$SHIP_SSH_OPTS" --port $TEST_HOST1_PORT --skip-md5 --compress=off \
-    --stall-timeout 2 --quiet "$STALL_FILE:$DEST" 127.0.0.1 2>&1 || true
+# Ship should detect stall and exit with code 1 (not hang until timeout kills it with 124)
+set +e
+timeout 10 $SHIP "$SHIP_SSH_OPTS" --port $TEST_HOST1_PORT --skip-md5 --compress=off \
+    --stall-timeout=2 --quiet --tmp="$DEST" "$STALL_FILE:/tmp/ship_test_17_dest" 127.0.0.1 2>&1
 EXIT_CODE=$?
-# timeout returns 124 if it killed the process
-[ "$EXIT_CODE" != "124" ] && pass "stall detection in quiet mode" || fail "ship hung in quiet mode (stall not detected)"
+set -e
+[ "$EXIT_CODE" = "1" ] && pass "stall detection in quiet mode" || fail "stall detection quiet mode (expected exit 1, got $EXIT_CODE)"
 ssh_cmd $TEST_HOST1_PORT "rm -f $DEST" 2>/dev/null || true
 
 # Test 18: Stall detection with progress (bug #1 - deadlock)
 echo "Test 18: Stall detection deadlock check"
-# Use a FIFO as dest so the write blocks once the FIFO buffer fills up (64K typically)
 DEST="/tmp/ship_test_18_fifo"
 ssh_cmd $TEST_HOST1_PORT "rm -f $DEST; mkfifo $DEST"
-# Nobody reads the FIFO, so "cat > fifo" will block after the pipe buffer fills.
-# Ship should detect stall and exit cleanly (not deadlock).
-timeout 15 $SHIP "$SHIP_SSH_OPTS" --port $TEST_HOST1_PORT --skip-md5 --compress=off \
-    --stall-timeout 2 "$STALL_FILE:$DEST" 127.0.0.1 2>&1 || true
+# Ship should detect stall and exit with code 1 (not deadlock)
+set +e
+timeout 10 $SHIP "$SHIP_SSH_OPTS" --port $TEST_HOST1_PORT --skip-md5 --compress=off \
+    --stall-timeout=2 --tmp="$DEST" "$STALL_FILE:/tmp/ship_test_18_dest" 127.0.0.1 2>&1
 EXIT_CODE=$?
-[ "$EXIT_CODE" != "124" ] && pass "stall detection no deadlock" || fail "deadlock in stall detection"
+set -e
+[ "$EXIT_CODE" = "1" ] && pass "stall detection no deadlock" || fail "stall detection deadlock (expected exit 1, got $EXIT_CODE)"
 ssh_cmd $TEST_HOST1_PORT "rm -f $DEST" 2>/dev/null || true
 
 echo ""
