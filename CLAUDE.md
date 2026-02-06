@@ -21,6 +21,11 @@
 - **Tests**: Never weaken thresholds to pass. Fix problems or document why expected.
 - **CLI**: kebab-case only (`--radio-port` not `--radio_port`)
 
+## Debugging ship hangs
+- `kill -USR1 <pid>` dumps all host states to stderr: status, progress, stall duration, child/gzip pids, control path, error
+- Check `/proc/<pid>/task/*/wchan` to see what kernel call each thread is blocked on
+- `ps -eLf | grep <pid>` to see all threads and child processes
+
 ## Testing
 - `make test` - runs unit tests + integration tests with sanitizers enabled
 - `test/setup.sh` - spins up 3 local sshd instances on ports 17722-17724
