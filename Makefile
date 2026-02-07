@@ -28,5 +28,6 @@ ciall:
 	zig build --release=fast -Dstrip=true -Dversion=${VERSION} -Dtarget=aarch64-linux-musl -Doutput=dist/ship-Linux-aarch64
 	zig build --release=fast -Dstrip=true -Dversion=${VERSION} -Dtarget=x86_64-macos       -Doutput=dist/ship-Darwin-x86_64
 	zig build --release=fast -Dstrip=true -Dversion=${VERSION} -Dtarget=aarch64-macos      -Doutput=dist/ship-Darwin-arm64
-	zig build --release=fast -Dstrip=true -Dversion=${VERSION} -Dtarget=x86_64-windows     -Doutput=dist/ship-Windows-x86_64.exe
+# windows is just too damn complicated to support when I don't really need it
+#	zig build --release=fast -Dstrip=true -Dversion=${VERSION} -Dtarget=x88_64-windows     -Doutput=dist/ship-Windows-x86_64.exe
 endif
