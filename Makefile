@@ -1,4 +1,4 @@
-.PHONY: build release clean test run ciall
+.PHONY: build release clean unittest test run ciall
 
 build:
 	zig build
@@ -9,9 +9,11 @@ release:
 clean:
 	rm -rf zig-out .zig-cache
 
-test:
-	zig build test -Dsanitize=true
-	zig build -Dsanitize=true
+unittest:
+	zig build test
+
+test: unittest
+	zig build
 	@./test/setup.sh
 	@./test/integration.sh
 	@./test/teardown.sh

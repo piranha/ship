@@ -8,7 +8,14 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            run-integration: true
+          - os: macos-latest
+            run-integration: false
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -17,4 +24,4 @@ jobs:
           version: 0.15.2
 
       - name: Test
-        run: make test
+        run: ${{ matrix.run-integration && 'make test' || 'make unittest' }}
