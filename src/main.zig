@@ -524,9 +524,17 @@ const Ship = struct {
         const line = switch (status) {
             .done => std.fmt.bufPrint(&buf, "{s} OK\n", .{label}) catch return,
             .skipped => std.fmt.bufPrint(&buf, "{s} SKIP\n", .{label}) catch return,
-            .failed => blk: {
+            .failed => {
                 const msg = self.states[idx].error_msg orelse "unknown";
-                break :blk std.fmt.bufPrint(&buf, "{s} ERR {s}\n", .{ label, msg }) catch return;
+                var rest: []const u8 = msg;
+                while (rest.len > 0) {
+                    const nl = std.mem.indexOfScalar(u8, rest, '\n');
+                    const line_part = if (nl) |n| rest[0..n] else rest;
+                    rest = if (nl) |n| rest[n + 1 ..] else "";
+                    const out = std.fmt.bufPrint(&buf, "ERR {s}: {s}\n", .{ label, line_part }) catch continue;
+                    stdout.writeAll(out) catch {};
+                }
+                return;
             },
             else => return,
         };
@@ -1250,6 +1258,27 @@ const Ship = struct {
         defer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);
         if (!termSuccess(result.term)) {
+            const exit_code: []const u8 = switch (result.term) {
+                .Exited => |code| std.fmt.allocPrint(self.allocator, "exit code {d}", .{code}) catch "non-zero exit",
+                .Signal => |sig| std.fmt.allocPrint(self.allocator, "signal {d}", .{sig}) catch "killed by signal",
+                else => "abnormal termination",
+            };
+            const exit_allocated = switch (result.term) {
+                .Exited, .Signal => true,
+                else => false,
+            };
+            defer if (exit_allocated) self.allocator.free(exit_code);
+            const output = std.mem.trim(u8, result.stderr, " \t\r\n");
+            const msg = if (output.len > 0)
+                std.fmt.allocPrint(self.allocator, "restart failed ({s})\n{s}", .{ exit_code, output }) catch null
+            else
+                std.fmt.allocPrint(self.allocator, "restart failed ({s})", .{exit_code}) catch null;
+            if (msg) |m| {
+                // setErrorMsg dupes, so set directly under lock
+                self.mutex.lock();
+                self.states[idx].error_msg = m;
+                self.mutex.unlock();
+            }
             return error.RestartFailed;
         }
     }
@@ -1486,9 +1515,16 @@ const Ship = struct {
             if (state.status == .failed) {
                 const label = self.getHostLabel(state.spec);
                 const msg = state.error_msg orelse "unknown error";
-                var buf: [256]u8 = undefined;
-                const line = std.fmt.bufPrint(&buf, "{s}: {s}\n", .{ label, msg }) catch continue;
-                stdout.writeAll(line) catch {};
+                // print each line prefixed with "ERR host: "
+                var rest: []const u8 = msg;
+                while (rest.len > 0) {
+                    const nl = std.mem.indexOfScalar(u8, rest, '\n');
+                    const line = if (nl) |n| rest[0..n] else rest;
+                    rest = if (nl) |n| rest[n + 1 ..] else "";
+                    var buf: [1024]u8 = undefined;
+                    const out = std.fmt.bufPrint(&buf, "ERR {s}: {s}\n", .{ label, line }) catch continue;
+                    stdout.writeAll(out) catch {};
+                }
             }
         }
     }
