@@ -1,6 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const opt = @import("opt");
+const native_os = builtin.os.tag;
 
 const CompressMode = enum { auto, on, off };
 
@@ -174,6 +176,7 @@ fn parseArgs(allocator: std.mem.Allocator) !?Config {
     const positionals = opt.parse(Options, &opts, args[1..]) catch |e| {
         if (e == error.Help) {
             printUsage();
+            std.process.argsFree(allocator, args);
             return null;
         }
         std.debug.print("Error parsing arguments: {s}\n", .{@errorName(e)});
@@ -185,10 +188,12 @@ fn parseArgs(allocator: std.mem.Allocator) !?Config {
         var stdout = std.fs.File.stdout().writer(&buf);
         stdout.interface.print("ship {s}\n", .{build_options.version}) catch {};
         stdout.interface.flush() catch {};
+        std.process.argsFree(allocator, args);
         return null;
     }
     if (positionals.len < 2) {
         printUsage();
+        std.process.argsFree(allocator, args);
         return null;
     }
 
@@ -283,7 +288,7 @@ const Ship = struct {
         const act = std.posix.Sigaction{
             .handler = .{ .handler = handleSigUsr1 },
             .mask = std.posix.sigemptyset(),
-            .flags = std.os.linux.SA.RESTART,
+            .flags = std.posix.SA.RESTART,
         };
         std.posix.sigaction(std.posix.SIG.USR1, &act, null);
     }
@@ -617,7 +622,7 @@ const Ship = struct {
     }
 
     fn startControlMaster(self: *Ship, idx: u32, spec: HostSpec) !void {
-        const pid = std.os.linux.getpid();
+        const pid = std.posix.system.getpid();
         const control_path = try std.fmt.allocPrint(self.allocator, "/tmp/.ship-{d}-{d}-{s}.sock", .{ pid, idx, spec.host });
         errdefer self.allocator.free(control_path);
 
@@ -887,7 +892,7 @@ const Ship = struct {
         }
 
         const basename = std.fs.path.basename(self.config.local_path);
-        const pid = std.os.linux.getpid();
+        const pid = std.posix.system.getpid();
 
         // build temp filename
         var tmp_name_buf: [256]u8 = undefined;
